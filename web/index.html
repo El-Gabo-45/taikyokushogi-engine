@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Taikyoku Shogi</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body {
+        font-family: 'Segoe UI', system-ui, sans-serif;
+        background: #1a1a2e;
+        color: #e0e0e0;
+        min-height: 100vh;
+        overflow: hidden;
+      }
+      .header {
+        background: #16213e;
+        padding: 8px 16px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        border-bottom: 2px solid #0f3460;
+        flex-wrap: wrap;
+      }
+      .header h1 { font-size: 16px; color: #e94560; white-space: nowrap; }
+      .controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+      .controls select, .controls button {
+        padding: 3px 8px;
+        border-radius: 4px;
+        border: 1px solid #0f3460;
+        background: #1a1a2e;
+        color: #e0e0e0;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .controls button { background: #0f3460; }
+      .controls button:hover { background: #e94560; }
+      .controls label { font-size: 11px; color: #aaa; }
+      .status-bar { font-size: 11px; color: #aaa; margin-left: auto; text-align: right; }
+      .main {
+        display: flex;
+        gap: 10px;
+        padding: 8px;
+        height: calc(100vh - 44px);
+        justify-content: center;
+      }
+      .board-wrap {
+        overflow: auto;
+        border: 2px solid #0f3460;
+        background: #0a0a1a;
+      }
+      .board-wrap canvas { display: block; }
+      .sidebar {
+        width: 240px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+      .panel {
+        background: #16213e;
+        border: 1px solid #0f3460;
+        border-radius: 6px;
+        padding: 8px;
+      }
+      .panel h3 { font-size: 11px; color: #e94560; margin-bottom: 4px; }
+      .info-row { display: flex; justify-content: space-between; font-size: 11px; padding: 2px 0; }
+      .info-row .label { color: #888; }
+      .move-log {
+        flex: 1;
+        overflow-y: auto;
+        font-size: 10px;
+        font-family: monospace;
+      }
+      .move-log .entry { padding: 1px 4px; border-bottom: 1px solid #0a0a1a; }
+      .move-log .entry:nth-child(odd) { background: rgba(255,255,255,0.02); }
+      #status-msg { color: #e94560; font-weight: bold; }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <h1>Taikyoku Shogi</h1>
+      <div class="controls">
+        <label>Mode:</label>
+        <select id="mode-select">
+          <option value="human_vs_random">Human vs Random</option>
+          <option value="human_vs_ai">Human vs AI</option>
+          <option value="random_vs_random">Random vs Random</option>
+          <option value="ai_vs_ai">AI vs AI</option>
+        </select>
+        <label>Play as:</label>
+        <select id="color-select">
+          <option value="0">Black</option>
+          <option value="1">White</option>
+        </select>
+        <label>AI:</label>
+        <select id="ai-depth">
+          <option value="0">Random</option>
+          <option value="1">D1</option>
+          <option value="2" selected>D2</option>
+          <option value="3">D3</option>
+        </select>
+        <button onclick="newGame()">New Game</button>
+        <button onclick="undoMove()">Undo</button>
+        <button id="auto-btn" onclick="toggleAuto()">Auto</button>
+      </div>
+      <div class="status-bar" id="status">Loading...</div>
+    </div>
+    <div class="main">
+      <div class="board-wrap">
+        <canvas id="board-canvas"></canvas>
+      </div>
+      <div class="sidebar">
+        <div class="panel" style="flex-shrink:0;">
+          <h3>Info</h3>
+          <div class="info-row"><span class="label">Turn:</span><span id="info-turn">Black</span></div>
+          <div class="info-row"><span class="label">Move:</span><span id="info-move">1</span></div>
+          <div class="info-row"><span class="label">Black:</span><span id="info-black">402</span></div>
+          <div class="info-row"><span class="label">White:</span><span id="info-white">402</span></div>
+          <div class="info-row"><span class="label">Score:</span><span id="info-score">0</span></div>
+          <div class="info-row"><span class="label" id="status-msg">-</span></div>
+        </div>
+        <div class="panel" style="flex:1; display:flex; flex-direction:column; min-height:0;">
+          <h3>Move Log</h3>
+          <div class="move-log" id="move-log"></div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

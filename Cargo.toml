@@ -1,0 +1,68 @@
+[package]
+name = "taikyokushogi"
+version = "0.1.0"
+edition = "2021"
+description = "Taikyoku Shogi engine — the largest known shogi variant (36x36 board, 804 pieces, 209 piece types)"
+license = "MIT"
+repository = "https://github.com/jh85/taikyokushogi"
+readme = "README.md"
+keywords = ["shogi", "taikyoku", "board-game", "chess-variant", "game-engine"]
+categories = ["games", "game-engines"]
+exclude = [
+    "web/",
+]
+
+[lib]
+name = "taikyokushogi"
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "taikyokushogi-server"
+path = "src/main.rs"
+
+
+[features]
+default = ["cpu"]
+cpu = []
+gpu-cuda = ["burn/cuda"]
+gpu-metal = ["burn/metal"]
+gpu-wgpu = ["burn/wgpu"]
+gpu-vulkan = ["burn/wgpu", "wgpu/vulkan-portability"]
+nnue = ["burn", "ndarray"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
+rand = "0.8"
+burn = { version = "0.21", default-features = false, features = ["ndarray", "autodiff"], optional = true }
+ndarray = { version = "0.16", optional = true }
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors"] }
+rayon = "1.10"
+crossbeam = "0.8"
+parking_lot = "0.12"
+dashmap = "5.5"
+half = "2.5"
+bytemuck = "1.15"
+memmap2 = "0.9"
+bincode = "1.3"
+lz4 = "1.24"
+xxhash-rust = "0.8"
+portable-atomic = { version = "1.6", features = ["critical-section"] }
+wgpu = { version = "22", features = ["vulkan-portability"], optional = true }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = true
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+
+[[example]]
+name = "play"
