@@ -262,3 +262,39 @@ static RAY_TABLE: OnceLock<RayTable> = OnceLock::new();
 pub fn ray_table() -> &'static RayTable {
     RAY_TABLE.get_or_init(RayTable::new)
 }
+
+struct ZobristTable {
+    piece_keys: Vec<[u64; NUM_SQUARES]>,
+    side_key: u64,
+}
+
+static ZOBRIST_TABLE: OnceLock<ZobristTable> = OnceLock::new();
+
+fn zobrist_table() -> &'static ZobristTable {
+    ZOBRIST_TABLE.get_or_init(|| {
+        let mut s: u64 = 0xDEAD_BEEF_CAFE_1234;
+        let mut rng = || -> u64 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        };
+        // 512 slots: pt*2 + color, covers all piece types + promotions for both sides
+        let mut piece_keys = vec![[0u64; NUM_SQUARES]; 512];
+        for pt in 0..512 {
+            for sq in 0..NUM_SQUARES {
+                piece_keys[pt][sq] = rng();
+            }
+        }
+        ZobristTable { piece_keys, side_key: rng() }
+    })
+}
+
+#[inline]
+pub fn zobrist_piece_key(pt: u16, sq: usize, color: u8) -> u64 {
+    let idx = (pt as usize * 2 + color as usize).min(511);
+    zobrist_table().piece_keys[idx][sq]
+}
+
+#[inline]
+pub fn zobrist_side_key() -> u64 {
+    zobrist_table().side_key
+}
