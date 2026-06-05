@@ -66,15 +66,15 @@ pub fn zone_family_bonus(zone: Zone, family: crate::eval::families::Family) -> i
 
 /// Compute the total zone bonus for a side.
 pub fn zone_score(board: &Board, color: u8) -> i32 {
+    let c = color as usize;
     let mut score = 0;
-    for sq in 0..1296 {
+    for i in 0..board.piece_list_len[c] {
+        let sq = board.piece_list[c][i] as usize;
+        if sq >= NUM_SQUARES { continue; }
         let cell = board.cells[sq];
         if cell == EMPTY_CELL { continue; }
         let piece = cell_piece(cell);
-        let piece_color = cell_color(cell);
-        if piece_color != color { continue; }
-
-        let rank = (sq / 36) as u8;
+        let rank = (sq / BOARD_SIZE) as u8;
         let zone = Zone::from_rank(rank, color);
         let fam = crate::eval::families::classify(piece);
         score += zone_family_bonus(zone, fam);
