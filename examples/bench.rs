@@ -22,7 +22,7 @@ fn main() {
     let us = t.elapsed().as_micros() as f64 / 1000.0;
     println!("eval: {:.1}us each", us);
 
-    // 3. Medir depth-1 search completo
+    // 3. Medir depth-1 search
     let mut board = Board::initial();
     let t = Instant::now();
     let result = board.search(1, 0);
@@ -30,17 +30,20 @@ fn main() {
     println!("depth-1 search: {} nodes  {:.2}ms  {:.0} nps",
              result.nodes, ms, result.nodes as f64 / (ms / 1000.0));
 
-    // 4. Medir solo movegen + apply/undo depth-1 (sin eval)
-    let moves = b.legal_moves();
-    let mut board2 = Board::initial();
+    // 4. Simular selfplay: 10 movimientos
+    let mut board = Board::initial();
     let t = Instant::now();
-    let mut nodes = 0u64;
-    for m in &moves {
-        board2.apply(m);
-        nodes += 1;
-        board2.undo();
+    let mut total_nodes = 0u64;
+    for i in 0..10 {
+        let result = board.search(1, 0);
+        if let Some(mv) = result.best_move {
+            board.apply(&mv);
+            total_nodes += result.nodes;
+        } else {
+            break;
+        }
     }
-    let ms2 = t.elapsed().as_micros() as f64 / 1000.0;
-    println!("movegen+apply+undo ({:.0} moves): {:.2}ms  {:.0} nodes/s",
-             moves.len() as f64, ms2, nodes as f64 / (ms2 / 1000.0));
+    let ms = t.elapsed().as_micros() as f64 / 1000.0;
+    println!("selfplay (10 moves, depth-1): {:.2}ms  {:.0} nps",
+             ms, total_nodes as f64 / (ms / 1000.0));
 }

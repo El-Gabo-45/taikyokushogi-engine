@@ -184,7 +184,7 @@ let info = taikyokushogi::piece_info("LN").unwrap();
 println!("{}: {} (area={}, igui={})", info.name, info.value, info.area_steps, info.has_igui);
 ```
 
-## Créditos y Atribución
+## Credits and copyright
 
 This is a *fork* of **[taikyokushogi](https://github.com/jh85/taikyokushogi)** a complate engine for Taikyoku Shogi originally developed by **[jh85](https://github.com/jh85)**. 
 
