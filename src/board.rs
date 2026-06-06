@@ -408,6 +408,7 @@ impl Board {
 
     fn add_sq_to_piece_list(&mut self, sq: usize, color: usize) {
         let idx = self.piece_list_len[color];
+        if idx >= MAX_PIECES_PER_SIDE { return; }
         self.piece_index[sq] = idx as u16;
         self.piece_list[color][idx] = sq as u16;
         self.piece_list_len[color] = idx + 1;

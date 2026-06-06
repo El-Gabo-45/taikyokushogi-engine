@@ -1,60 +1,68 @@
-//! Example: play a random game of Taikyoku Shogi and display the result.
+//! Play a real game of Taikyoku Shogi with actual search.
 //!
 //! ```sh
-//! cargo run --example play
+//! cargo run --release --example play
 //! ```
 
-use taikyokushogi::{Board, Color};
+use taikyokushogi::Board;
+use std::time::Instant;
 
 fn main() {
+    println!("=== Taikyoku Shogi Self-Play ===");
+    println!("Board: 36x36 = {} squares", 36*36);
+    println!();
+
+    // Play a game with depth-1 search (full search)
     let mut board = Board::initial();
+    println!("Initial: Black={} White={}",
+             board.piece_count(taikyokushogi::Color::Black),
+             board.piece_count(taikyokushogi::Color::White));
 
-    println!("=== Taikyoku Shogi ===");
-    println!("Board: 36x36, {} squares", taikyokushogi::BOARD_SIZE * taikyokushogi::BOARD_SIZE);
-    println!("Black pieces: {}", board.piece_count(Color::Black));
-    println!("White pieces: {}", board.piece_count(Color::White));
-    println!();
+    let start = Instant::now();
+    let mut total_nodes: u64 = 0;
+    let mut total_moves: u32 = 0;
 
-    // Count legal moves from the starting position
-    let moves = board.legal_moves();
-    println!("{} legal moves from starting position", moves.len());
-    println!();
-
-    // Look up piece info
-    if let Some(info) = taikyokushogi::piece_info("K") {
-        println!("King: value={}, slides={} dirs, royal=true", info.value, info.slide_directions);
-    }
-    if let Some(info) = taikyokushogi::piece_info("LN") {
-        println!("Lion: value={}, area={} steps, igui={}", info.value, info.area_steps, info.has_igui);
-    }
-    println!();
-
-    // Play a random game
-    println!("Playing random game (max 500 moves)...");
-    let mut move_count = 0;
-    loop {
-        if move_count >= 500 { break; }
+    for move_no in 0..50 {
         if let Some(result) = board.game_result() {
-            println!("Game over at move {}: {}", move_count, result);
+            println!("Game over at move {}: {:?}", move_no, result);
             break;
         }
-        let mv = match board.random_move() {
-            Some(m) => m,
-            None => { println!("No legal moves at move {}", move_count); break; }
-        };
-        board.apply(&mv);
-        move_count += 1;
-    }
-    println!("After {} moves: Black={}, White={}", move_count,
-             board.piece_count(Color::Black), board.piece_count(Color::White));
-    println!("Material score (Black's perspective): {}", board.material_score());
-    println!();
 
-    // Run a depth-1 search from the starting position
-    let mut fresh = Board::initial();
-    let result = fresh.search(1, 0);
-    if let Some(mv) = result.best_move {
-        println!("Depth-1 search: best={}, score={}, {} nodes in {}ms",
-                 mv, result.score, result.nodes, result.time_ms);
+        // Use search with depth=1, no time limit, at every other move
+        // (depth=0 is just eval, which is fast)
+        let result = if move_no % 2 == 0 {
+            board.search(1, 0)  // depth 1
+        } else {
+            board.search(0, 0)  // just eval
+        };
+
+        total_nodes += result.nodes;
+
+        if let Some(mv) = result.best_move {
+            if move_no < 3 || move_no % 10 == 9 {
+                println!("Move {:3}: {}->{} score={:6} nodes={:7} time={}ms",
+                         move_no + 1, mv.from(), mv.to(), result.score, result.nodes, result.time_ms);
+            }
+            board.apply(&mv);
+            total_moves += 1;
+        } else {
+            println!("No legal moves at move {}", move_no + 1);
+            break;
+        }
     }
+
+    let elapsed = start.elapsed();
+    let ms = elapsed.as_millis() as u64;
+    println!();
+    println!("=== Results ===");
+    println!("Moves played: {}", total_moves);
+    println!("Total nodes: {}", total_nodes);
+    println!("Total time: {}ms", ms);
+    if ms > 0 {
+        println!("Search speed: {:.0} nps", total_nodes as f64 / (ms as f64 / 1000.0));
+    }
+    println!("Final: Black={} White={}",
+             board.piece_count(taikyokushogi::Color::Black),
+             board.piece_count(taikyokushogi::Color::White));
+    println!("Material score (Black): {}", board.material_score());
 }
