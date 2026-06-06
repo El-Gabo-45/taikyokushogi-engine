@@ -14,6 +14,8 @@ pub struct Board {
     // Royal piece tracking
     pub royal_list: [[u16; MAX_ROYALS]; 2],
     pub royal_count: [usize; 2],
+    // O(1) reverse index: piece_index[sq] = position in piece_list for that square
+    pub piece_index: [u16; NUM_SQUARES],
     // Incremental Zobrist hash — updated in apply_move/undo_move
     pub hash: u64,
     // Undo stack
@@ -32,6 +34,7 @@ impl Clone for Board {
             piece_count: self.piece_count,
             royal_list: self.royal_list,
             royal_count: self.royal_count,
+            piece_index: self.piece_index,
             hash: self.hash,
             history: self.history.clone(),
         }
@@ -50,6 +53,7 @@ impl Board {
             piece_count: [0; 2],
             royal_list: [[INVALID_SQ; MAX_ROYALS]; 2],
             royal_count: [0; 2],
+            piece_index: [INVALID_SQ; NUM_SQUARES],
             hash: 0,
             history: Vec::new(),
         }
@@ -65,13 +69,14 @@ impl Board {
         self.piece_count = [0; 2];
         self.royal_list = [[INVALID_SQ; MAX_ROYALS]; 2];
         self.royal_count = [0; 2];
+        self.piece_index = [INVALID_SQ; NUM_SQUARES];
         self.hash = 0;
         self.history.clear();
 
         // Place Black's pieces (rows 24-35)
         for (rank_idx, rank_str) in pieces::SETUP_RANKS.iter().enumerate() {
             let rank_pieces = pieces::parse_setup_rank(rank_str);
-            let row = 35 - rank_idx; // Rank 1 at row 35
+            let row = 35 - rank_idx;
             for (col, piece_opt) in rank_pieces.iter().enumerate() {
                 if let Some(pt) = piece_opt {
                     self.place_piece(row, col, *pt, BLACK);
@@ -82,7 +87,7 @@ impl Board {
         // Place White's pieces (rows 0-11) — 180-degree rotation
         for (rank_idx, rank_str) in pieces::SETUP_RANKS.iter().enumerate() {
             let rank_pieces = pieces::parse_setup_rank(rank_str);
-            let row = rank_idx; // Rank 1 at row 0
+            let row = rank_idx;
             let len = rank_pieces.len();
             for (col, piece_opt) in rank_pieces.iter().enumerate() {
                 if let Some(pt) = piece_opt {
@@ -97,24 +102,21 @@ impl Board {
         self.cells[sq] = make_cell(pt, color);
         let c = color as usize;
 
-        // Add to piece list
         let idx = self.piece_list_len[c];
+        self.piece_index[sq] = idx as u16;
         self.piece_list[c][idx] = sq as u16;
         self.piece_list_len[c] = idx + 1;
         self.piece_count[c] += 1;
 
-        // Track royals
         if pieces::is_royal(pt) {
             let ri = self.royal_count[c];
             self.royal_list[c][ri] = sq as u16;
             self.royal_count[c] = ri + 1;
         }
 
-        // Update hash incrementally
         self.hash ^= zobrist_piece_key(pt, sq, color);
     }
 
-    /// Get the cell value at a given square index.
     #[inline]
     #[allow(dead_code)]
     pub fn at(&self, sq: usize) -> Cell {
@@ -142,7 +144,6 @@ impl Board {
             hash: self.hash,
         };
 
-        // Update no-progress counter: reset on capture or promotion
         let is_capture = to_cell != EMPTY_CELL
             || m.mid_sq != INVALID_SQ
             || m.range_caps.is_some()
@@ -159,7 +160,6 @@ impl Board {
             for &(sq, _cap_pt, _cap_color) in caps {
                 let cap_cell = self.cells[sq as usize];
                 saved.push((sq, cap_cell));
-                // Remove from hash
                 if cap_cell != EMPTY_CELL {
                     self.hash ^= zobrist_piece_key(
                         cell_piece(cap_cell), sq as usize, cell_color(cap_cell));
@@ -190,10 +190,8 @@ impl Board {
                 self.remove_from_lists(to);
                 self.cells[to] = EMPTY_CELL;
             }
-            // Piece may promote in place
             if m.promotion {
                 if let Some(promo_pt) = pieces::promotes_to(pt) {
-                    // Remove old, add new
                     self.hash ^= zobrist_piece_key(pt, from, color);
                     let new_cell = make_cell(promo_pt, color);
                     self.cells[from] = new_cell;
@@ -223,7 +221,6 @@ impl Board {
             self.remove_from_lists(to);
         }
 
-        // Determine final piece (promotion)
         let final_pt = if m.promotion {
             pieces::promotes_to(pt).unwrap_or(pt)
         } else {
@@ -252,7 +249,6 @@ impl Board {
             None => return false,
         };
 
-        // Restore hash directly from saved value — O(1), no recomputation needed
         self.hash = undo.hash;
         self.side_to_move = undo.side;
         self.move_number = undo.move_number;
@@ -261,45 +257,84 @@ impl Board {
         let from = undo.from_sq as usize;
         let to = undo.to_sq as usize;
 
-        // Check if it was igui
-        if undo.from_sq == undo.to_sq && undo.to_cell != EMPTY_CELL {
+        // Igui: fall back to rebuild (rare)
+        if undo.from_sq == undo.to_sq {
             self.cells[from] = undo.from_cell;
             if undo.mid_sq != INVALID_SQ {
                 self.cells[undo.mid_sq as usize] = undo.mid_cell;
-            }
-            if let Some(ref caps) = undo.range_caps {
-                for &(sq, cell) in caps {
-                    self.cells[sq as usize] = cell;
-                }
             }
             self.rebuild_lists();
             return true;
         }
 
-        // Standard undo
-        self.cells[to] = EMPTY_CELL;
+        // ── Incremental undo ─────────────────────────────────────────────
+
+        // 1. Remove piece from destination (where apply put it)
+        //    remove_sq_from_piece_list does the swap+decrement in O(1)
+        let dest_cell = self.cells[to];
+        if dest_cell != EMPTY_CELL {
+            let dest_pt = cell_piece(dest_cell);
+            let dest_c = cell_color(dest_cell) as usize;
+            self.remove_sq_from_piece_list(to, dest_c);
+            if pieces::is_royal(dest_pt) { self.remove_sq_from_royal_list(to, dest_c); }
+            self.cells[to] = EMPTY_CELL;
+        }
+
+        // 2. Restore original piece at origin
+        let orig_pt = cell_piece(undo.from_cell);
+        let orig_c = cell_color(undo.from_cell) as usize;
         self.cells[from] = undo.from_cell;
+        self.add_sq_to_piece_list(from, orig_c);
+        if pieces::is_royal(orig_pt) {
+            self.royal_list[orig_c][self.royal_count[orig_c]] = from as u16;
+            self.royal_count[orig_c] += 1;
+        }
+
+        // 3. Restore captured piece at destination
         if undo.to_cell != EMPTY_CELL {
+            let cap_pt = cell_piece(undo.to_cell);
+            let cap_c = cell_color(undo.to_cell) as usize;
             self.cells[to] = undo.to_cell;
-        }
-
-        // Restore mid-capture
-        if undo.mid_sq != INVALID_SQ {
-            self.cells[undo.mid_sq as usize] = undo.mid_cell;
-        }
-
-        // Restore range captures
-        if let Some(ref caps) = undo.range_caps {
-            for &(sq, cell) in caps {
-                self.cells[sq as usize] = cell;
+            self.add_sq_to_piece_list(to, cap_c);
+            if pieces::is_royal(cap_pt) {
+                self.royal_list[cap_c][self.royal_count[cap_c]] = to as u16;
+                self.royal_count[cap_c] += 1;
             }
         }
 
-        self.rebuild_lists();
+        // 4. Restore mid-capture (lion)
+        if undo.mid_sq != INVALID_SQ && undo.mid_cell != EMPTY_CELL {
+            let msq = undo.mid_sq as usize;
+            let mid_pt = cell_piece(undo.mid_cell);
+            let mid_c = cell_color(undo.mid_cell) as usize;
+            self.cells[msq] = undo.mid_cell;
+            self.add_sq_to_piece_list(msq, mid_c);
+            if pieces::is_royal(mid_pt) {
+                self.royal_list[mid_c][self.royal_count[mid_c]] = msq as u16;
+                self.royal_count[mid_c] += 1;
+            }
+        }
+
+        // 5. Restore range captures
+        if let Some(ref caps) = undo.range_caps {
+            for &(sq, cell) in caps {
+                if cell != EMPTY_CELL {
+                    let squ = sq as usize;
+                    let cap_pt = cell_piece(cell);
+                    let cap_c = cell_color(cell) as usize;
+                    self.cells[squ] = cell;
+                    self.add_sq_to_piece_list(squ, cap_c);
+                    if pieces::is_royal(cap_pt) {
+                        self.royal_list[cap_c][self.royal_count[cap_c]] = sq;
+                        self.royal_count[cap_c] += 1;
+                    }
+                }
+            }
+        }
+
         true
     }
 
-    /// Rebuild piece position indices from the cells array.
     pub fn rebuild_lists_pub(&mut self) {
         self.rebuild_lists();
     }
@@ -308,8 +343,6 @@ impl Board {
         self.piece_list_len = [0; 2];
         self.piece_count = [0; 2];
         self.royal_count = [0; 2];
-        self.piece_list = [[INVALID_SQ; MAX_PIECES_PER_SIDE]; 2];
-        self.royal_list = [[INVALID_SQ; MAX_ROYALS]; 2];
 
         for sq in 0..NUM_SQUARES {
             let cell = self.cells[sq];
@@ -318,6 +351,7 @@ impl Board {
                 let color = cell_color(cell);
                 let c = color as usize;
                 let idx = self.piece_list_len[c];
+                self.piece_index[sq] = idx as u16;
                 self.piece_list[c][idx] = sq as u16;
                 self.piece_list_len[c] = idx + 1;
                 self.piece_count[c] += 1;
@@ -326,33 +360,37 @@ impl Board {
                     self.royal_list[c][ri] = sq as u16;
                     self.royal_count[c] = ri + 1;
                 }
+            } else {
+                self.piece_index[sq] = INVALID_SQ;
             }
         }
     }
 
+    // remove_from_lists: used by apply_move for captured pieces
     fn remove_from_lists(&mut self, sq: usize) {
         let cell = self.cells[sq];
         if cell == EMPTY_CELL { return; }
         let pt = cell_piece(cell);
         let color = cell_color(cell) as usize;
-        self.remove_sq_from_piece_list(sq, color);
-        self.piece_count[color] -= 1;
+        self.remove_sq_from_piece_list(sq, color); // also decrements piece_count
         if pieces::is_royal(pt) {
             self.remove_sq_from_royal_list(sq, color);
         }
     }
 
+    // O(1) removal using piece_index
     fn remove_sq_from_piece_list(&mut self, sq: usize, color: usize) {
-        let sq16 = sq as u16;
+        let idx = self.piece_index[sq] as usize;
         let len = self.piece_list_len[color];
-        for i in 0..len {
-            if self.piece_list[color][i] == sq16 {
-                self.piece_list[color][i] = self.piece_list[color][len - 1];
-                self.piece_list[color][len - 1] = INVALID_SQ;
-                self.piece_list_len[color] = len - 1;
-                return;
-            }
-        }
+        if idx >= len { return; }
+        // Swap with last
+        let last_sq = self.piece_list[color][len - 1] as usize;
+        self.piece_list[color][idx] = last_sq as u16;
+        self.piece_index[last_sq] = idx as u16;
+        self.piece_list[color][len - 1] = INVALID_SQ;
+        self.piece_index[sq] = INVALID_SQ;
+        self.piece_list_len[color] = len - 1;
+        self.piece_count[color] -= 1;
     }
 
     fn remove_sq_from_royal_list(&mut self, sq: usize, color: usize) {
@@ -370,6 +408,7 @@ impl Board {
 
     fn add_sq_to_piece_list(&mut self, sq: usize, color: usize) {
         let idx = self.piece_list_len[color];
+        self.piece_index[sq] = idx as u16;
         self.piece_list[color][idx] = sq as u16;
         self.piece_list_len[color] = idx + 1;
         self.piece_count[color] += 1;
@@ -385,8 +424,6 @@ impl Board {
         }
     }
 
-    /// Get the square of the first royal piece (King or Crown Prince) for a color.
-    /// Returns INVALID_SQ if no royal piece exists.
     pub fn king_square(&self, color: u8) -> u16 {
         let c = color as usize;
         if self.royal_count[c] > 0 {
@@ -435,8 +472,6 @@ impl Board {
         s
     }
 
-    /// Null move: just switch side to move without moving any piece.
-    /// Used for null move pruning in search.
     pub fn null_move(&mut self) {
         let undo = UndoInfo {
             from_sq: INVALID_SQ,
@@ -458,7 +493,6 @@ impl Board {
         self.history.push(undo);
     }
 
-    /// Undo a null move.
     pub fn undo_null_move(&mut self) {
         if let Some(undo) = self.history.pop() {
             self.hash = undo.hash;
