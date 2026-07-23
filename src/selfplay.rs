@@ -1,9 +1,4 @@
 //! GPU-accelerated self-play for Taikyoku Shogi.
-//!
-//! This module provides high-performance self-play generation with:
-//! - Parallel search using rayon
-//! - Lock-free transposition table
-//! - Training data export for NNUE training
 use crate::types::*;
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
@@ -15,58 +10,68 @@ use std::thread::JoinHandle;
 
 use crossbeam::channel::{bounded, Sender, Receiver};
 
-/// Configuration for self-play
 #[derive(Debug, Clone)]
 pub struct SelfPlayConfig {
-    /// Number of parallel games
     pub num_games: usize,
-    /// Search depth per move
+    pub num_workers: usize,
     pub depth: u32,
-    /// Time limit per move (ms)
     pub time_limit_ms: u64,
-    /// Maximum moves per game
     pub max_moves: u32,
-    /// Output directory for training data
     pub output_dir: String,
-    /// Save every N games
     pub save_interval: usize,
+    pub sqlite_path: Option<String>,
 }
 
 impl Default for SelfPlayConfig {
     fn default() -> Self {
         Self {
             num_games: 4,
-            depth: 2,
-            time_limit_ms: 100,
-            max_moves: 500,
+            num_workers: 2,
+            depth: 1,
+            time_limit_ms: 0,
+            max_moves: 200,
             output_dir: "training_data".to_string(),
             save_interval: 100,
+            sqlite_path: Some("training_data/games.db".to_string()),
         }
     }
 }
 
-/// Compact game state for training data
 #[derive(Clone, Copy, Debug)]
 pub struct TrainingSample {
-    /// Board state: 1296 squares × 2 bytes (piece type) = 2592 bytes
     pub board: [u16; 1296],
-    /// Side to move: 0 = Black, 1 = White
     pub side_to_move: u8,
-    /// Move played
     pub move_from: u16,
     pub move_to: u16,
     pub move_promo: u8,
-    /// Game result: 1 = Black win, -1 = White win, 0 = draw
     pub result: i8,
-    /// Policy target (move index in legal moves)
     pub policy_target: u16,
-    /// Value target (-1 to 1)
     pub value_target: f32,
-    /// Move number
     pub move_number: u16,
 }
 
-/// Statistics for monitoring
+#[derive(Clone, Debug)]
+pub struct GameMove {
+    pub move_number: u16,
+    pub from: u16,
+    pub to: u16,
+    pub promo: u8,
+    pub captured_piece: u16,
+    pub side: u8,
+    pub black_pieces: usize,
+    pub white_pieces: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct GameRecord {
+    pub game_id: u64,
+    pub result: i8,
+    pub moves: Vec<GameMove>,
+    pub total_moves: u32,
+    pub depth: u32,
+    pub duration_ms: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct SelfPlayStats {
     pub games_completed: AtomicUsize,
@@ -81,7 +86,6 @@ impl SelfPlayStats {
         let moves = self.total_moves.load(Ordering::Relaxed);
         let nodes = self.total_nodes.load(Ordering::Relaxed);
         let time = self.total_time_ms.load(Ordering::Relaxed);
-        
         println!("=== Self-Play Stats ===");
         println!("Games: {}", games);
         if games > 0 {
@@ -94,237 +98,322 @@ impl SelfPlayStats {
     }
 }
 
-/// Lock-free transposition table
-pub struct TranspositionTable {
-    entries: Vec<std::sync::atomic::AtomicU64>,
-    mask: usize,
-}
-
-impl TranspositionTable {
-    pub fn new(size_mb: usize) -> Self {
-        let entry_size = 16;
-        let num_entries = (size_mb * 1024 * 1024) / entry_size;
-        let num_entries = num_entries.next_power_of_two();
-        
-        let entries = (0..num_entries)
-            .map(|_| std::sync::atomic::AtomicU64::new(0))
-            .collect();
-        
-        Self {
-            entries,
-            mask: num_entries - 1,
-        }
-    }
-    
-    #[inline]
-    pub fn probe(&self, key: u64) -> Option<(i32, u32)> {
-        let _idx = (key as usize) & self.mask;
-        let _packed = self.entries[_idx].load(Ordering::Relaxed);
-        if _packed == 0 { return None; }
-        None
-    }
-    
-    #[inline]
-    pub fn store(&self, key: u64, _value: i32, _best_move: u32) {
-        let idx = (key as usize) & self.mask;
-        self.entries[idx].store(1, Ordering::Relaxed);
-    }
-}
-
-/// Self-play worker
 struct SelfPlayWorker {
     id: usize,
     config: SelfPlayConfig,
     stats: Arc<SelfPlayStats>,
     sample_tx: Sender<TrainingSample>,
+    game_tx: Sender<GameRecord>,
 }
 
 impl SelfPlayWorker {
-    fn run(&mut self) {
+    fn play_one_game(&mut self, game_id: u64) -> (Vec<TrainingSample>, GameRecord) {
+        let mut board = Board::new();
+        board.setup_initial();
+        let start = std::time::Instant::now();
+
+        let mut move_count = 0u32;
+        let mut game_samples: Vec<TrainingSample> = Vec::new();
+        let mut game_moves: Vec<GameMove> = Vec::new();
+        let mut result_val: i8 = 0;
+
         loop {
-            let mut board = Board::new();
-            board.setup_initial();
-            
-            let mut move_count = 0;
-            let mut game_samples: Vec<TrainingSample> = Vec::new();
-            
-            while move_count < self.config.max_moves {
-                if let Some(result) = board.game_result() {
-                    let result_val = match result {
-                        GameResult::BlackWins => 1,
-                        GameResult::WhiteWins => -1,
-                        GameResult::Draw => 0,
-                    };
-                    
-                    for sample in &mut game_samples {
-                        sample.result = result_val;
-                        sample.value_target = result_val as f32;
-                        let _ = self.sample_tx.send(*sample);
-                    }
+            if move_count >= self.config.max_moves {
+                result_val = 0;
+                break;
+            }
+
+            if let Some(result) = board.game_result() {
+                result_val = match result {
+                    GameResult::BlackWins => 1i8,
+                    GameResult::WhiteWins => -1i8,
+                    GameResult::Draw => 0i8,
+                };
+                break;
+            }
+
+            let search_result = search(&mut board, self.config.depth, self.config.time_limit_ms);
+            let best_move = match search_result.best_move {
+                Some(m) => m,
+                None => {
+                    result_val = if board.side_to_move == BLACK { -1i8 } else { 1i8 };
                     break;
                 }
-                
-                let search_result = search(&mut board, self.config.depth, self.config.time_limit_ms);
-                
-                if let Some(best_move) = search_result.best_move {
-                    let mut sample = TrainingSample {
-                        board: [0; 1296],
-                        side_to_move: board.side_to_move,
-                        move_from: best_move.from_sq,
-                        move_to: best_move.to_sq,
-                        move_promo: best_move.promotion as u8,
-                        result: 0,
-                        policy_target: 0,
-                        value_target: 0.0,
-                        move_number: board.move_number as u16,
-                    };
-                    
-                    for sq in 0..1296 {
-                        let cell = board.cells[sq];
-                        if cell != EMPTY_CELL {
-                            sample.board[sq] = cell_piece(cell) | ((cell_color(cell) as u16) << 8);
-                        }
-                    }
-                    
-                    let moves = generate_legal_moves(&board);
-                    for (idx, m) in moves.iter().enumerate() {
-                        if m.from_sq == best_move.from_sq && m.to_sq == best_move.to_sq && m.promotion == best_move.promotion {
-                            sample.policy_target = idx as u16;
-                            break;
-                        }
-                    }
-                    
-                    game_samples.push(sample);
-                    
-                    board.apply_move(&best_move);
-                    move_count += 1;
-                    
-                    self.stats.total_moves.fetch_add(1, Ordering::Relaxed);
-                    self.stats.total_nodes.fetch_add(search_result.nodes, Ordering::Relaxed);
-                    self.stats.total_time_ms.fetch_add(search_result.time_ms, Ordering::Relaxed);
-                } else {
+            };
+
+            let side = board.side_to_move;
+            let black_pieces = board.piece_count[0];
+            let white_pieces = board.piece_count[1];
+
+            game_moves.push(GameMove {
+                move_number: (move_count + 1) as u16,
+                from: best_move.from_sq,
+                to: best_move.to_sq,
+                promo: best_move.promotion as u8,
+                captured_piece: best_move.captured_piece,
+                side,
+                black_pieces,
+                white_pieces,
+            });
+
+            let mut sample = TrainingSample {
+                board: [0; 1296],
+                side_to_move: side,
+                move_from: best_move.from_sq,
+                move_to: best_move.to_sq,
+                move_promo: best_move.promotion as u8,
+                result: 0,
+                policy_target: 0,
+                value_target: 0.0,
+                move_number: board.move_number as u16,
+            };
+            for sq in 0..1296 {
+                let cell = board.cells[sq];
+                if cell != EMPTY_CELL {
+                    sample.board[sq] = cell_piece(cell) | ((cell_color(cell) as u16) << 8);
+                }
+            }
+            let moves = generate_legal_moves(&board);
+            for (idx, m) in moves.iter().enumerate() {
+                if m.from_sq == best_move.from_sq && m.to_sq == best_move.to_sq && m.promotion == best_move.promotion {
+                    sample.policy_target = idx as u16;
                     break;
                 }
             }
-            
-            self.stats.games_completed.fetch_add(1, Ordering::Relaxed);
-            
-            let games = self.stats.games_completed.load(Ordering::Relaxed);
-            if games % 10 == 0 {
-                self.stats.print();
-            }
+            game_samples.push(sample);
+
+            board.apply_move(&best_move);
+            move_count += 1;
+            self.stats.total_moves.fetch_add(1, Ordering::Relaxed);
+            self.stats.total_nodes.fetch_add(search_result.nodes, Ordering::Relaxed);
+            self.stats.total_time_ms.fetch_add(search_result.time_ms, Ordering::Relaxed);
         }
+
+        for s in &mut game_samples {
+            let from_perspective = if s.side_to_move == BLACK { result_val as f32 } else { -(result_val as f32) };
+            s.value_target = from_perspective;
+            s.result = from_perspective as i8;
+        }
+
+        let record = GameRecord {
+            game_id,
+            result: result_val,
+            moves: game_moves,
+            total_moves: move_count,
+            depth: self.config.depth,
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+
+        (game_samples, record)
+    }
+
+    fn run(&mut self) {
+        let total_games = self.config.num_games;
+        let num_workers = self.config.num_workers.max(1);
+        let games_per_worker = (total_games + num_workers - 1) / num_workers;
+        let my_start = self.id * games_per_worker;
+        let my_end = std::cmp::min(my_start + games_per_worker, total_games);
+        if my_start >= total_games {
+            eprintln!("[worker-{}] no games assigned", self.id);
+            return;
+        }
+        let my_count = my_end - my_start;
+        eprintln!("[worker-{}] will play {} games ({}..{})", self.id, my_count, my_start, my_end);
+
+        for (i, game_id) in (my_start..my_end).enumerate() {
+            let (samples, record) = self.play_one_game(game_id as u64);
+            let n = samples.len();
+            let result_str = match record.result { 1 => "BlackWins", -1 => "WhiteWins", _ => "Draw" };
+            for s in samples {
+                let _ = self.sample_tx.send(s);
+            }
+            let _ = self.game_tx.send(record);
+            self.stats.games_completed.fetch_add(1, Ordering::Relaxed);
+            eprintln!("[worker-{}] game {}/{} (id={}) finished: {} moves, result={}",
+                self.id, i + 1, my_count, game_id, n, result_str);
+        }
+
     }
 }
 
-/// Main self-play coordinator
 pub struct SelfPlayCoordinator {
     config: SelfPlayConfig,
     stats: Arc<SelfPlayStats>,
     workers: Vec<JoinHandle<()>>,
     writer_handle: Option<JoinHandle<()>>,
+    db_handle: Option<JoinHandle<()>>,
+    sample_tx: Sender<TrainingSample>,
+    game_tx: Sender<GameRecord>,
 }
 
 impl SelfPlayCoordinator {
     pub fn new(config: SelfPlayConfig) -> Self {
         let stats = Arc::new(SelfPlayStats::default());
-        
-        let (_sample_tx, sample_rx) = bounded(10000);
-        
+        let (sample_tx, sample_rx) = bounded(10000);
+        let (game_tx, game_rx) = bounded(1000);
+
         let output_dir = config.output_dir.clone();
         let save_interval = config.save_interval;
         let writer_handle = std::thread::spawn(move || {
             Self::writer_loop(sample_rx, output_dir, save_interval);
         });
-        
+
+        let db_handle = if let Some(db_path) = &config.sqlite_path {
+            let db_path = db_path.clone();
+            let output_dir = config.output_dir.clone();
+            Some(std::thread::spawn(move || {
+                Self::db_loop(game_rx, db_path, output_dir);
+            }))
+        } else {
+            None
+        };
+
         Self {
-            config,
-            stats,
-            workers: Vec::new(),
-            writer_handle: Some(writer_handle),
+            config, stats, workers: Vec::new(),
+            writer_handle: Some(writer_handle), db_handle,
+            sample_tx, game_tx,
         }
     }
-    
+
     fn writer_loop(rx: Receiver<TrainingSample>, output_dir: String, save_interval: usize) {
         std::fs::create_dir_all(&output_dir).ok();
-        
-        let mut buffer = Vec::new();
+        let mut buffer: Vec<TrainingSample> = Vec::new();
         let mut file_count = 0;
-        
+        let mut last_print = std::time::Instant::now();
+        let mut total_saved = 0u64;
         while let Ok(sample) = rx.recv() {
             buffer.push(sample);
-            
             if buffer.len() >= save_interval {
                 let filename = format!("{}/samples_{:06}.bin", output_dir, file_count);
-                // Simple binary serialization
                 let mut data = Vec::with_capacity(buffer.len() * std::mem::size_of::<TrainingSample>());
-                for sample in &buffer {
-                    let bytes = unsafe { std::slice::from_raw_parts(
-                        sample as *const TrainingSample as *const u8,
-                        std::mem::size_of::<TrainingSample>()
-                    )};
+                for s in &buffer {
+                    let bytes = unsafe { std::slice::from_raw_parts(s as *const TrainingSample as *const u8, std::mem::size_of::<TrainingSample>()) };
                     data.extend_from_slice(bytes);
                 }
-                std::fs::write(&filename, &data).ok();
-                println!("Saved {} samples to {}", buffer.len(), filename);
+                let _ = std::fs::write(&filename, &data);
+                total_saved += buffer.len() as u64;
+                println!("[writer] Saved {} samples (total {}) to {}", buffer.len(), total_saved, filename);
                 buffer.clear();
                 file_count += 1;
             }
+            if last_print.elapsed().as_secs() >= 2 {
+                last_print = std::time::Instant::now();
+                println!("[writer] buffer={} samples pending", buffer.len());
+            }
         }
-        
         if !buffer.is_empty() {
             let filename = format!("{}/samples_{:06}.bin", output_dir, file_count);
             let mut data = Vec::with_capacity(buffer.len() * std::mem::size_of::<TrainingSample>());
-            for sample in &buffer {
-                let bytes = unsafe { std::slice::from_raw_parts(
-                    sample as *const TrainingSample as *const u8,
-                    std::mem::size_of::<TrainingSample>()
-                )};
+            for s in &buffer {
+                let bytes = unsafe { std::slice::from_raw_parts(s as *const TrainingSample as *const u8, std::mem::size_of::<TrainingSample>()) };
                 data.extend_from_slice(bytes);
             }
-            std::fs::write(&filename, &data).ok();
+            let _ = std::fs::write(&filename, &data);
+            total_saved += buffer.len() as u64;
+            println!("[writer] Flushed {} samples (total {}) to {}", buffer.len(), total_saved, filename);
         }
     }
-    
+
+    fn db_loop(rx: Receiver<GameRecord>, db_path: String, output_dir: String) {
+        std::fs::create_dir_all(&output_dir).ok();
+        let conn = match rusqlite::Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => { eprintln!("[db] open failed: {}", e); return; }
+        };
+        if let Err(e) = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS games (
+                id INTEGER PRIMARY KEY,
+                result INTEGER NOT NULL,
+                total_moves INTEGER NOT NULL,
+                depth INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                created_at REAL NOT NULL DEFAULT (julianday('now'))
+            );
+            CREATE TABLE IF NOT EXISTS moves (
+                game_id INTEGER NOT NULL,
+                move_number INTEGER NOT NULL,
+                from_sq INTEGER NOT NULL,
+                to_sq INTEGER NOT NULL,
+                promo INTEGER NOT NULL,
+                captured INTEGER NOT NULL,
+                side INTEGER NOT NULL,
+                black_pieces INTEGER NOT NULL,
+                white_pieces INTEGER NOT NULL,
+                PRIMARY KEY (game_id, move_number)
+            );"
+        ) {
+            eprintln!("[db] schema failed");
+            return;
+        }
+        let mut total = 0u64;
+        let mut last_print = std::time::Instant::now();
+        while let Ok(record) = rx.recv() {
+            if let Err(e) = conn.execute(
+                "INSERT INTO games (id, result, total_moves, depth, duration_ms) VALUES (?, ?, ?, ?, ?)",
+                rusqlite::params![record.game_id as i64, record.result as i64, record.total_moves as i64, record.depth as i64, record.duration_ms as i64]
+            ) {
+                eprintln!("[db] insert game failed: {}", e);
+                continue;
+            }
+            let tx = match conn.unchecked_transaction() { Ok(t) => t, Err(_) => continue };
+            let mut failed = false;
+            for m in &record.moves {
+                if tx.execute(
+                    "INSERT INTO moves (game_id, move_number, from_sq, to_sq, promo, captured, side, black_pieces, white_pieces) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    rusqlite::params![
+                        record.game_id as i64, m.move_number as i64, m.from as i64, m.to as i64,
+                        m.promo as i64, m.captured_piece as i64, m.side as i64,
+                        m.black_pieces as i64, m.white_pieces as i64,
+                    ]
+                ).is_err() { failed = true; break; }
+            }
+            if !failed { let _ = tx.commit(); }
+            total += 1;
+            if last_print.elapsed().as_secs() >= 2 {
+                last_print = std::time::Instant::now();
+                println!("[db] games={} written to {}", total, db_path);
+            }
+        }
+        println!("[db] Done: {} games written to {}", total, db_path);
+    }
+
     pub fn start(&mut self) {
-        for i in 0..self.config.num_games {
-            let (tx, _) = bounded(10000);
-            
-            let mut worker = SelfPlayWorker {
-                id: i,
-                config: self.config.clone(),
-                stats: self.stats.clone(),
-                sample_tx: tx,
-            };
-            
+        let num_workers = self.config.num_workers.max(1);
+        for i in 0..num_workers {
+            let tx = self.sample_tx.clone();
+            let gx = self.game_tx.clone();
+            let config = self.config.clone();
+            let stats = self.stats.clone();
             let handle = std::thread::spawn(move || {
+                let mut worker = SelfPlayWorker { id: i, config, stats, sample_tx: tx, game_tx: gx };
                 worker.run();
             });
-            
             self.workers.push(handle);
         }
     }
-    
+
     pub fn wait(mut self) {
         for handle in self.workers.drain(..) {
-            handle.join().ok();
+            let _ = handle.join();
         }
-        
+        drop(self.sample_tx);
+        drop(self.game_tx);
         if let Some(writer) = self.writer_handle.take() {
-            writer.join().ok();
+            let _ = writer.join();
         }
-        
-        println!("Self-play completed!");
+        if let Some(db) = self.db_handle.take() {
+            let _ = db.join();
+        }
+        println!("\nSelf-play completed!");
         self.stats.print();
     }
 }
 
-/// Run self-play with default config
 pub fn run_selfplay(config: Option<SelfPlayConfig>) {
     let config = config.unwrap_or_default();
-    println!("Starting self-play with {} games", config.num_games);
-    
-    let mut coordinator = SelfPlayCoordinator::new(config);
-    coordinator.start();
-    coordinator.wait();
+    println!("Starting self-play: {} games, {} workers, depth={}, max_moves={}",
+        config.num_games, config.num_workers, config.depth, config.max_moves);
+    let mut coord = SelfPlayCoordinator::new(config);
+    coord.start();
+    coord.wait();
 }

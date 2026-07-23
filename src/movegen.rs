@@ -32,7 +32,181 @@ pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
             gen_igui(board, sq, pt, color, &mut moves);
         }
     }
-    moves
+    
+    // Filter out moves that leave the king in check
+    filter_legal_moves(board, moves)
+}
+
+fn filter_legal_moves(board: &Board, mut moves: Vec<Move>) -> Vec<Move> {
+    let mut legal_moves = Vec::with_capacity(moves.len());
+    let mut board_copy = board.clone();
+    
+    for m in moves.drain(..) {
+        board_copy.apply_move(&m);
+        if !is_in_check(&board_copy) {
+            legal_moves.push(m);
+        }
+        board_copy.undo_move();
+    }
+    
+    legal_moves
+}
+
+pub fn is_in_check(board: &Board) -> bool {
+    let king_sq = board.king_square(board.side_to_move);
+    if king_sq == INVALID_SQ { return false; }
+    let king_sq_usize = king_sq as usize;
+    let opp = 1 - board.side_to_move;
+    let rt = crate::types::ray_table();
+
+    for i in 0..board.piece_list_len[opp as usize] {
+        let sq = board.piece_list[opp as usize][i] as usize;
+        if sq >= NUM_SQUARES { continue; }
+        let cell = board.cells[sq];
+        if cell == EMPTY_CELL { continue; }
+        let pt = cell_piece(cell);
+        let mv = pieces::movement(pt);
+
+        for &(jdr, jdc) in &mv.jumps {
+            let r = (sq / BOARD_SIZE) as i32;
+            let c = (sq % BOARD_SIZE) as i32;
+            let (dr, dc) = if opp == BLACK { (jdr as i32, jdc as i32) } else { (-(jdr as i32), -(jdc as i32)) };
+            let nr = r + dr; let nc = c + dc;
+            if nr < 0 || nr >= BOARD_SIZE as i32 || nc < 0 || nc >= BOARD_SIZE as i32 { continue; }
+            if (nr as usize * BOARD_SIZE + nc as usize) == king_sq_usize { return true; }
+        }
+
+        for &(dir, max_range) in &mv.slides {
+            let ray = rt.ray_for_color(sq, dir as usize, opp);
+            let limit = if max_range == 0 { ray.len() } else { (max_range as usize).min(ray.len()) };
+            for &rsq in &ray[..limit] {
+                let rsq = rsq as usize;
+                if rsq == king_sq_usize { return true; }
+                if board.cells[rsq] != EMPTY_CELL { break; }
+            }
+        }
+        
+        // Check hook moves
+        if mv.hook.is_some() {
+            let dirs: &[usize] = match mv.hook {
+                Some(HookType::Orthogonal) => &[N, E, S, W],
+                Some(HookType::Diagonal) => &[NE, SE, SW, NW],
+                None => &[],
+            };
+            
+            for &d in dirs {
+                let ray = rt.ray_for_color(sq, d, opp);
+                for &mid_sq in ray.iter() {
+                    let mid = mid_sq as usize;
+                    let target = board.cells[mid];
+                    if target != EMPTY_CELL {
+                        if cell_color(target) != opp {
+                            // Blocked by friendly piece
+                        }
+                        break;
+                    }
+                    // At this empty square, try turning 90 degrees
+                    let turn_dirs = match mv.hook {
+                        Some(HookType::Orthogonal) => {
+                            if d == N || d == S { vec![E, W] } else { vec![N, S] }
+                        }
+                        Some(HookType::Diagonal) => {
+                            match d {
+                                NE => vec![NW, SE], SE => vec![NE, SW],
+                                SW => vec![SE, NW], NW => vec![NE, SW],
+                                _ => vec![],
+                            }
+                        }
+                        None => vec![],
+                    };
+                    for td in turn_dirs {
+                        let turn_ray = rt.ray_for_color(mid, td, opp);
+                        for &tsq in turn_ray {
+                            let t = board.cells[tsq as usize];
+                            if t == EMPTY_CELL {
+                                continue;
+                            } else if cell_color(t) != opp {
+                                if tsq as usize == king_sq_usize { return true; }
+                                break;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Check area moves (lion/lion dog)
+        if mv.area > 0 {
+            let r = sq_row(sq) as i32;
+            let c = sq_col(sq) as i32;
+            
+            for d1 in 0..NUM_DIRS {
+                let (dr1, dc1) = get_deltas(d1, opp);
+                let r1 = r + dr1;
+                let c1 = c + dc1;
+                if r1 < 0 || r1 >= BOARD_SIZE as i32 || c1 < 0 || c1 >= BOARD_SIZE as i32 { continue; }
+                let sq1 = r1 as usize * BOARD_SIZE + c1 as usize;
+                let t1 = board.cells[sq1];
+                if t1 != EMPTY_CELL && cell_color(t1) == opp { continue; }
+                
+                if sq1 == king_sq_usize { return true; }
+                
+                if mv.area >= 2 {
+                    for d2 in 0..NUM_DIRS {
+                        let (dr2, dc2) = get_deltas(d2, opp);
+                        let r2 = r1 + dr2;
+                        let c2 = c1 + dc2;
+                        if r2 < 0 || r2 >= BOARD_SIZE as i32 || c2 < 0 || c2 >= BOARD_SIZE as i32 { continue; }
+                        let sq2 = r2 as usize * BOARD_SIZE + c2 as usize;
+                        if sq2 == sq { continue; }
+                        let t2 = board.cells[sq2];
+                        if t2 != EMPTY_CELL && cell_color(t2) == opp { continue; }
+                        
+                        if sq2 == king_sq_usize { return true; }
+                    }
+                }
+            }
+        }
+        
+        // Check range capture moves
+        if !mv.range_capture.is_empty() {
+            let piece_rank = pieces::rank(pt);
+            
+            for &dir in &mv.range_capture {
+                let ray = rt.ray_for_color(sq, dir as usize, opp);
+                
+                for &rsq in ray {
+                    let target = board.cells[rsq as usize];
+                    if target == EMPTY_CELL {
+                        if rsq as usize == king_sq_usize { return true; }
+                    } else {
+                        let t_pt = cell_piece(target);
+                        let t_rank = pieces::rank(t_pt);
+                        if t_rank > piece_rank {
+                            if rsq as usize == king_sq_usize { return true; }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Check igui
+        if mv.igui {
+            for d in 0..NUM_DIRS {
+                if let Some(nsq) = step_sq(sq, d, opp) {
+                    let target = board.cells[nsq];
+                    if target != EMPTY_CELL && cell_color(target) != opp {
+                        if nsq == king_sq_usize { return true; }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 #[inline]

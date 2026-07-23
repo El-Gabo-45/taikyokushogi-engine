@@ -45,7 +45,7 @@ mod movegen;
 mod eval;
 mod search;
 mod tsfen;
-mod selfplay;
+pub mod selfplay;
 
 #[cfg(feature = "python")]
 mod python;

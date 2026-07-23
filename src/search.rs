@@ -7,12 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-// ── Transposition Table ──────────────────────────────────────────
-const TT_SIZE: usize = 1 << 20; // 1M entries ≈ 8MB
+// ── Transposition Table (full u64 key, 128-bit entries) ──────────
+const TT_SIZE: usize = 1 << 20; // 1M entries, each 16 bytes
 
 #[derive(Clone, Copy)]
 struct TTEntry {
-    key: u16,
     score: i32,
     depth: u8,
     flag: u8,
@@ -22,7 +21,7 @@ struct TTEntry {
 static TT: OnceLock<Vec<AtomicU64>> = OnceLock::new();
 
 fn tt() -> &'static Vec<AtomicU64> {
-    TT.get_or_init(|| (0..TT_SIZE).map(|_| AtomicU64::new(0)).collect())
+    TT.get_or_init(|| (0..TT_SIZE * 2).map(|_| AtomicU64::new(0)).collect())
 }
 
 #[inline]
@@ -34,8 +33,7 @@ fn tt_index(hash: u64) -> usize {
 fn tt_pack(entry: &TTEntry) -> u64 {
     let score_clamped = entry.score.clamp(-32000, 32000) as i16 as u16;
     let mv16 = (entry.best_move & 0xFFFF) as u16;
-    ((entry.key as u64) << 48)
-        | ((score_clamped as u64) << 32)
+    ((score_clamped as u64) << 32)
         | ((entry.depth as u64) << 24)
         | ((entry.flag as u64) << 16)
         | (mv16 as u64)
@@ -44,7 +42,6 @@ fn tt_pack(entry: &TTEntry) -> u64 {
 #[inline]
 fn tt_unpack(packed: u64) -> TTEntry {
     TTEntry {
-        key: ((packed >> 48) & 0xFFFF) as u16,
         score: ((packed >> 32) & 0xFFFF) as u16 as i16 as i32,
         depth: ((packed >> 24) & 0xFF) as u8,
         flag: ((packed >> 16) & 0xFF) as u8,
@@ -52,24 +49,31 @@ fn tt_unpack(packed: u64) -> TTEntry {
     }
 }
 
-fn tt_probe(hash: u64) -> Option<TTEntry> {
-    let idx = tt_index(hash);
-    let packed = tt()[idx].load(Ordering::Relaxed);
-    if packed == 0 { return None; }
-    let entry = tt_unpack(packed);
-    if entry.key == (hash as u16) { Some(entry) } else { None }
+fn tt_probe(hash: u64) -> Option<(TTEntry, u32)> {
+    let idx = tt_index(hash) * 2;
+    let t = tt();
+    let stored_hash = t[idx].load(Ordering::Relaxed);
+    if stored_hash == hash {
+        let entry = tt_unpack(t[idx + 1].load(Ordering::Relaxed));
+        Some((entry, entry.best_move))
+    } else {
+        None
+    }
 }
 
 fn tt_store(hash: u64, entry: TTEntry) {
-    let idx = tt_index(hash);
+    let idx = tt_index(hash) * 2;
     let t = tt();
-    let old = t[idx].load(Ordering::Relaxed);
-    if old == 0 {
-        t[idx].store(tt_pack(&entry), Ordering::Relaxed);
+    let old_hash = t[idx].load(Ordering::Relaxed);
+    if old_hash == 0 {
+        t[idx].store(hash, Ordering::Relaxed);
+        t[idx + 1].store(tt_pack(&entry), Ordering::Relaxed);
     } else {
-        let old_entry = tt_unpack(old);
-        if entry.depth >= old_entry.depth {
-            t[idx].store(tt_pack(&entry), Ordering::Relaxed);
+        let old_data = t[idx + 1].load(Ordering::Relaxed);
+        let old_entry = tt_unpack(old_data);
+        if entry.depth >= old_entry.depth || old_hash != hash {
+            t[idx].store(hash, Ordering::Relaxed);
+            t[idx + 1].store(tt_pack(&entry), Ordering::Relaxed);
         }
     }
 }
@@ -104,7 +108,9 @@ fn history() -> &'static Vec<AtomicU64> {
 
 fn history_store(from: usize, to: usize, depth: u32) {
     let idx = (from % HIST_SIZE) * HIST_SIZE + (to % HIST_SIZE);
-    history()[idx].fetch_add(depth as u64, Ordering::Relaxed);
+    // Quadratic bonus: depth*depth gives more weight to deeper cutoffs
+    let bonus = (depth * depth) as u64;
+    history()[idx].fetch_add(bonus, Ordering::Relaxed);
 }
 
 fn history_score(from: usize, to: usize) -> i32 {
@@ -145,7 +151,7 @@ fn move_order_score(m: &Move) -> i32 {
     score
 }
 
-// ── Public Search: optimize for depth-1 by limiting nodes ────────
+// ── Public Search ────────────────────────────────────────────────
 pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult {
     let start = Instant::now();
     let deadline = if time_limit_ms > 0 {
@@ -166,45 +172,95 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
         return SearchResult { best_move: Some(moves[0].clone()), score: 0, nodes: 1, time_ms: 0 };
     }
 
-    // Score moves for ordering (cheap: just captures + promotion values)
+    // Score moves for ordering
     let mut scored_moves: Vec<(i32, usize)> = moves.iter().enumerate()
         .map(|(i, m)| (move_order_score(m), i))
         .collect();
     scored_moves.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // Para depth-1: material_score es ~30× más rápido que evaluate() y 95%+ preciso
-    // (402 piezas por lado, el valor material domina). evaluate() completo solo para depth>=2
-    // y alphabeta recursivo para depth>=3.
     let max_moves = if depth <= 1 { moves.len() } else { moves.len().min(64) };
 
     if depth <= 1 {
+        // Compute baseline material score once, then adjust incrementally per move
+        // This avoids apply_move/undo_move (expensive: 800+ piece list updates, hash updates, undo stack)
+        // and avoids iterating all 800+ pieces in material_score() for every move
+        let base_mat = material_score(board);
         for rank in 0..max_moves {
             let idx = scored_moves[rank].1;
             let m = &moves[idx];
-            board.apply_move(m);
             nodes += 1;
-            // material_score es ~1µs vs 33µs de evaluate()
-            let score = -material_score(board);
-            board.undo_move();
+
+            // Compute material delta from Black's perspective directly from move data
+            let mut delta = 0i32;
+            let sign = if board.side_to_move == BLACK { 1 } else { -1 };
+
+            // Promotion: piece gains (promoted_value - original_value)
+            if m.promotion {
+                let pt = cell_piece(board.cells[m.from_sq as usize]);
+                if let Some(promo_pt) = pieces::promotes_to(pt) {
+                    delta += sign * (pieces::value(promo_pt) - pieces::value(pt));
+                }
+            }
+
+            // Captures: opponent loses pieces
+            if m.captured_piece != 0 {
+                delta += sign * pieces::value(m.captured_piece);
+            }
+            if m.mid_piece != 0 {
+                delta += sign * pieces::value(m.mid_piece);
+            }
+            if let Some(ref caps) = m.range_caps {
+                for &(_, pt, _) in caps {
+                    delta += sign * pieces::value(pt);
+                }
+            }
+
+            // Score from opponent's perspective after the move
+            let score = -(base_mat + delta);
             if score > best_score {
                 best_score = score;
                 best_move = Some(m.clone());
             }
         }
     } else {
+        // Iterative deepening: do depth 2 first to get a good TT move for deeper search
+        if depth > 2 {
+            // Shallow search to seed TT
+            let _ = alphabeta(board, depth - 2, -MATE_SCORE - 1, MATE_SCORE + 1,
+                             &mut nodes, deadline, 0, false);
+        }
+
         for rank in 0..max_moves {
             let idx = scored_moves[rank].1;
             let m = &moves[idx];
             board.apply_move(m);
             nodes += 1;
-            let score = -alphabeta(board, depth - 1, -MATE_SCORE - 1,
-                                   -best_score.max(-MATE_SCORE - 1),
-                                   &mut nodes, deadline, 0);
-            board.undo_move();
-            if score > best_score {
+
+            // Aspiration windows for deep searches
+            let (search_alpha, search_beta) = if depth > 3 && rank == 0 && best_score > -MATE_SCORE + 100 {
+                (best_score - 50, best_score + 50)
+            } else {
+                (-MATE_SCORE - 1, -best_score.max(-MATE_SCORE - 1))
+            };
+
+            let score = -alphabeta(board, depth - 1, search_alpha, search_beta,
+                                    &mut nodes, deadline, 0, true);
+
+            // Aspiration window fail - research with full window
+            if score <= search_alpha || score >= search_beta {
+                let full_score = -alphabeta(board, depth - 1, -MATE_SCORE - 1,
+                                            -best_score.max(-MATE_SCORE - 1),
+                                            &mut nodes, deadline, 0, true);
+                if full_score > best_score {
+                    best_score = full_score;
+                    best_move = Some(m.clone());
+                }
+            } else if score > best_score {
                 best_score = score;
                 best_move = Some(m.clone());
             }
+
+            board.undo_move();
             if let Some(dl) = deadline {
                 if Instant::now() >= dl { break; }
             }
@@ -215,17 +271,20 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
     SearchResult { best_move, score: best_score, nodes, time_ms: elapsed }
 }
 
-// ── Alpha-Beta (original, unchanged) ─────────────────────────────
+// ── Alpha-Beta (optimized) ──────────────────────────────────────
 fn alphabeta(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
-             nodes: &mut u64, deadline: Option<Instant>, ply: u32) -> i32 {
+             nodes: &mut u64, deadline: Option<Instant>, ply: u32,
+             enable_pruning: bool) -> i32 {
     *nodes += 1;
 
+    // Time check
     if *nodes & 4095 == 0 {
         if let Some(dl) = deadline {
             if Instant::now() >= dl { return alpha; }
         }
     }
 
+    // Terminal check
     if let Some(result) = board.game_result() {
         return match result {
             GameResult::BlackWins  => if board.side_to_move == BLACK { MATE_SCORE - ply as i32 } else { -(MATE_SCORE - ply as i32) },
@@ -234,7 +293,12 @@ fn alphabeta(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         };
     }
 
-    if depth == 0 {
+    // Check extension: extend by 1 ply if in check
+    let in_check = is_in_check(board);
+    let ext = if in_check && enable_pruning { 1 } else { 0 };
+    let effective_depth = depth + ext;
+
+    if effective_depth == 0 {
         let total_pieces = board.piece_count[0] + board.piece_count[1];
         if total_pieces < 200 {
             return quiescence(board, alpha, beta, nodes, deadline);
@@ -242,10 +306,10 @@ fn alphabeta(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         return evaluate(board);
     }
 
-    // TT probe
+    // TT probe (with full u64 hash verification)
     let hash = board.hash;
-    if let Some(entry) = tt_probe(hash) {
-        if entry.depth >= depth as u8 {
+    let tt_best_move = if let Some((entry, best_mv)) = tt_probe(hash) {
+        if entry.depth >= effective_depth as u8 {
             match entry.flag {
                 0 => return entry.score,
                 1 => { if entry.score >= beta  { return entry.score; } }
@@ -253,88 +317,122 @@ fn alphabeta(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
                 _ => {}
             }
         }
-    }
+        best_mv
+    } else {
+        0
+    };
 
-    // Null move pruning (R=3)
-    let side = board.side_to_move as usize;
-    if depth >= 3
-        && board.no_progress_plies < 100
-        && board.piece_count[side] > 10
-    {
-        let in_check = is_in_check(board);
-        if !in_check {
-            board.null_move();
-            let null_score = -alphabeta(board, depth.saturating_sub(3), -beta, -(beta - 1),
-                                        nodes, deadline, ply + 1);
-            board.undo_null_move();
-            if null_score >= beta {
-                return beta;
-            }
+    // Reverse futility pruning (RFP): at shallow depths, if static eval is
+    // far below alpha, prune the node entirely (no need to search captures).
+    if enable_pruning && depth <= 2 && !in_check {
+        let static_eval = evaluate(board);
+        let margin = 200 * depth as i32;
+        if static_eval + margin <= alpha {
+            return alpha;
+        }
+        if static_eval - margin >= beta {
+            return beta;
         }
     }
 
+    // Null move pruning (R=3) — skip if in check
+    let side = board.side_to_move as usize;
+    if enable_pruning && effective_depth >= 3
+        && board.no_progress_plies < 100
+        && board.piece_count[side] > 10
+        && !in_check
+    {
+        board.null_move();
+        let null_score = -alphabeta(board, effective_depth.saturating_sub(3), -beta, -(beta - 1),
+                                    nodes, deadline, ply + 1, enable_pruning);
+        board.undo_null_move();
+        if null_score >= beta {
+            return beta;
+        }
+    }
+
+    // Generate legal moves
     let moves = generate_legal_moves(board);
     if moves.is_empty() {
         return -(MATE_SCORE - ply as i32);
     }
 
     // Move ordering
-    let tt_best_move = tt_probe(board.hash).map(|e| e.best_move);
     let mut scored_moves: Vec<(i32, usize)> = moves.iter().enumerate()
         .map(|(i, m)| {
             let packed = m_pack(m);
             let mut score = move_order_score(m);
-            if Some(packed) == tt_best_move { score += 2_000_000; }
-            score += killer_score(depth, packed);
+            if packed == tt_best_move { score += 2_000_000; }
+            score += killer_score(effective_depth, packed);
             score += history_score(m.from_sq as usize, m.to_sq as usize);
             (score, i)
         })
         .collect();
     scored_moves.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // Limit nodes in alphabeta too for deep searches
-    let max_moves = if depth <= 2 { moves.len() } else { moves.len().min(32) };
+    let max_moves = if effective_depth <= 2 { moves.len() } else { moves.len().min(32) };
 
-    let mut tt_flag: u8 = 2;
+    let mut tt_flag: u8 = 2; // UPPERBOUND
     let mut best_local: Option<Move> = None;
+
+    // Store initial alpha for TT flag
+    let init_alpha = alpha;
 
     for (move_idx, &(_, idx)) in scored_moves[..max_moves].iter().enumerate() {
         let m = &moves[idx];
+
+        // Late move pruning: skip moves with low ordering score at depth 0 (after quiescence)
+        if enable_pruning && move_idx >= 4 && effective_depth <= 1 && alpha > -MATE_SCORE + 100 && !m.promotion && m.captured_piece == 0 {
+            let total_pieces = board.piece_count[0] + board.piece_count[1];
+            if total_pieces > 100 {
+                continue;
+            }
+        }
+
         board.apply_move(m);
 
-        let new_depth = if move_idx >= 4 && depth >= 3 && !m.promotion && m.captured_piece == 0 {
-            depth - 2
+        // Late Move Reduction (LMR): reduce depth for late moves
+        let new_depth = if enable_pruning && move_idx >= 4 && effective_depth >= 3 && !m.promotion && m.captured_piece == 0 && !in_check {
+            effective_depth.saturating_sub(2)
         } else {
-            depth - 1
+            effective_depth.saturating_sub(1)
         };
 
-        let mut score = -alphabeta(board, new_depth, -beta, -alpha, nodes, deadline, ply + 1);
-
-        if score >= beta && new_depth < depth - 1 {
-            score = -alphabeta(board, depth - 1, -beta, -alpha, nodes, deadline, ply + 1);
+        // PVS search: search first move with full window, rest with zero window
+        let score;
+        if move_idx == 0 {
+            score = -alphabeta(board, new_depth, -beta, -alpha, nodes, deadline, ply + 1, enable_pruning);
+        } else {
+            // Search with null window
+            let null_score = -alphabeta(board, new_depth, -alpha - 1, -alpha, nodes, deadline, ply + 1, enable_pruning);
+            if null_score > alpha && null_score < beta && new_depth < effective_depth.saturating_sub(1) {
+                // Re-search with full depth
+                score = -alphabeta(board, effective_depth.saturating_sub(1), -beta, -alpha, nodes, deadline, ply + 1, enable_pruning);
+            } else {
+                score = null_score;
+            }
         }
 
         board.undo_move();
 
         if score > alpha {
             alpha = score;
-            tt_flag = 0;
+            tt_flag = 0; // EXACT
             best_local = Some(m.clone());
         }
         if alpha >= beta {
-            tt_flag = 1;
-            killer_store(depth, m_pack(m));
-            history_store(m.from_sq as usize, m.to_sq as usize, depth);
+            tt_flag = 1; // LOWERBOUND
+            killer_store(effective_depth, m_pack(m));
+            history_store(m.from_sq as usize, m.to_sq as usize, effective_depth);
             break;
         }
     }
 
     if let Some(bm) = &best_local {
         tt_store(hash, TTEntry {
-            key: hash as u16,
             score: alpha,
-            depth: depth as u8,
-            flag: tt_flag,
+            depth: effective_depth as u8,
+            flag: if alpha <= init_alpha { 2 } else { tt_flag },
             best_move: m_pack(bm),
         });
     }
@@ -345,7 +443,7 @@ fn alphabeta(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
 // ── Quiescence Search ────────────────────────────────────────────
 const MAX_QDEPTH: u32 = 4;
 
-fn quiescence(board: &mut Board, mut alpha: i32, beta: i32,
+fn quiescence(board: &mut Board, alpha: i32, beta: i32,
               nodes: &mut u64, deadline: Option<Instant>) -> i32 {
     quiescence_inner(board, alpha, beta, nodes, deadline, 0)
 }
@@ -366,8 +464,21 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
     if qdepth >= MAX_QDEPTH { return alpha; }
 
     let moves = generate_legal_moves(board);
-    for m in &moves {
-        if m.captured_piece == 0 && m.mid_piece == 0 && !m.is_igui { continue; }
+
+    // Sort moves by capture value for better quiescence ordering
+    let mut scored_qmoves: Vec<(i32, usize)> = moves.iter().enumerate()
+        .filter(|(_, m)| m.captured_piece != 0 || m.mid_piece != 0 || m.is_igui)
+        .map(|(i, m)| {
+            let mut score = 0;
+            if m.captured_piece != 0 { score += pieces::value(m.captured_piece) * 10; }
+            if m.mid_piece != 0 { score += pieces::value(m.mid_piece) * 10; }
+            (score, i)
+        })
+        .collect();
+    scored_qmoves.sort_by(|a, b| b.0.cmp(&a.0));
+
+    for &(_, i) in &scored_qmoves {
+        let m = &moves[i];
         board.apply_move(m);
         let score = -quiescence_inner(board, -beta, -alpha, nodes, deadline, qdepth + 1);
         board.undo_move();
@@ -377,40 +488,4 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
     alpha
 }
 
-// ── Check Detection ──────────────────────────────────────────────
-fn is_in_check(board: &Board) -> bool {
-    let king_sq = board.king_square(board.side_to_move);
-    if king_sq == INVALID_SQ { return false; }
-    let king_sq_usize = king_sq as usize;
-    let opp = 1 - board.side_to_move;
-    let rt = crate::types::ray_table();
-
-    for i in 0..board.piece_list_len[opp as usize] {
-        let sq = board.piece_list[opp as usize][i] as usize;
-        if sq >= NUM_SQUARES { continue; }
-        let cell = board.cells[sq];
-        if cell == EMPTY_CELL { continue; }
-        let pt = cell_piece(cell);
-        let mv = pieces::movement(pt);
-
-        for &(jdr, jdc) in &mv.jumps {
-            let r = (sq / BOARD_SIZE) as i32;
-            let c = (sq % BOARD_SIZE) as i32;
-            let (dr, dc) = if opp == BLACK { (jdr as i32, jdc as i32) } else { (-(jdr as i32), -(jdc as i32)) };
-            let nr = r + dr; let nc = c + dc;
-            if nr < 0 || nr >= BOARD_SIZE as i32 || nc < 0 || nc >= BOARD_SIZE as i32 { continue; }
-            if (nr as usize * BOARD_SIZE + nc as usize) == king_sq_usize { return true; }
-        }
-
-        for &(dir, max_range) in &mv.slides {
-            let ray = rt.ray_for_color(sq, dir as usize, opp);
-            let limit = if max_range == 0 { ray.len() } else { (max_range as usize).min(ray.len()) };
-            for &rsq in &ray[..limit] {
-                let rsq = rsq as usize;
-                if rsq == king_sq_usize { return true; }
-                if board.cells[rsq] != EMPTY_CELL { break; }
-            }
-        }
-    }
-    false
-}
+use crate::movegen::is_in_check;
