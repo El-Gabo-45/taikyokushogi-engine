@@ -2,7 +2,9 @@ use crate::types::*;
 use crate::pieces;
 use crate::board::Board;
 
-pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
+/// Generate pseudo-legal moves (fast, no legality filtering).
+/// Does NOT filter out moves that leave king in check.
+pub fn generate_pseudo_legal_moves(board: &Board) -> Vec<Move> {
     let color = board.side_to_move;
     let c = color as usize;
     let rt = ray_table();
@@ -33,8 +35,13 @@ pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
         }
     }
     
-    // Filter out moves that leave the king in check
-    filter_legal_moves(board, moves)
+    moves
+}
+
+/// Generate legal moves (slower: filters pseudo-legal moves for legality).
+pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
+    let pseudo = generate_pseudo_legal_moves(board);
+    filter_legal_moves(board, pseudo)
 }
 
 fn filter_legal_moves(board: &Board, mut moves: Vec<Move>) -> Vec<Move> {
@@ -101,11 +108,9 @@ pub fn is_in_check(board: &Board) -> bool {
                     let target = board.cells[mid];
                     if target != EMPTY_CELL {
                         if cell_color(target) != opp {
-                            // Blocked by friendly piece
                         }
                         break;
                     }
-                    // At this empty square, try turning 90 degrees
                     let turn_dirs = match mv.hook {
                         Some(HookType::Orthogonal) => {
                             if d == N || d == S { vec![E, W] } else { vec![N, S] }
@@ -214,17 +219,11 @@ fn can_promote(pt: u16) -> bool {
     pieces::promotes_to(pt).is_some()
 }
 
-/// Zone-based promotion rules:
-/// 1. Entering the promotion zone from outside -> may promote
-/// 2. Capturing inside the promotion zone -> may promote
-/// 3. Reaching the farthest rank with a forward-only piece -> MUST promote
-/// 4. Promotion is optional otherwise
 fn add_move(moves: &mut Vec<Move>, from: u16, to: u16, pt: u16, color: u8, target: Cell) {
     let captured = if target != EMPTY_CELL { cell_piece(target) } else { 0 };
     let cap_color = if target != EMPTY_CELL { cell_color(target) } else { 0 };
 
     if !can_promote(pt) {
-        // No promotion possible — just add the plain move
         moves.push(Move {
             from_sq: from, to_sq: to, promotion: false,
             captured_piece: captured, captured_color: cap_color,
@@ -238,18 +237,15 @@ fn add_move(moves: &mut Vec<Move>, from: u16, to: u16, pt: u16, color: u8, targe
     let to_in_zone = in_promo_zone(to as usize, color);
     let is_capture = captured != 0;
 
-    // Determine if promotion is allowed this move
     let may_promote =
-        (!from_in_zone && to_in_zone) ||       // entering zone
-        (from_in_zone && to_in_zone && is_capture); // capture inside zone
+        (!from_in_zone && to_in_zone) ||
+        (from_in_zone && to_in_zone && is_capture);
 
-    // Determine if promotion is forced (forward-only piece at farthest rank)
     let must_promote = to_in_zone
         && is_farthest_rank(to as usize, color)
         && pieces::must_promote_at_far_rank(pt);
 
     if must_promote {
-        // Only the promoted move
         moves.push(Move {
             from_sq: from, to_sq: to, promotion: true,
             captured_piece: captured, captured_color: cap_color,
@@ -257,7 +253,6 @@ fn add_move(moves: &mut Vec<Move>, from: u16, to: u16, pt: u16, color: u8, targe
             range_caps: None,
         });
     } else if may_promote {
-        // Both options: promote or don't
         moves.push(Move {
             from_sq: from, to_sq: to, promotion: false,
             captured_piece: captured, captured_color: cap_color,
@@ -271,7 +266,6 @@ fn add_move(moves: &mut Vec<Move>, from: u16, to: u16, pt: u16, color: u8, targe
             range_caps: None,
         });
     } else {
-        // No promotion available
         moves.push(Move {
             from_sq: from, to_sq: to, promotion: false,
             captured_piece: captured, captured_color: cap_color,
@@ -296,7 +290,7 @@ fn gen_slides(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
                 add_move(moves, sq as u16, target_sq as u16, pt, color, target);
                 break;
             } else {
-                break; // friendly piece blocks
+                break;
             }
         }
     }
@@ -344,7 +338,6 @@ fn gen_hooks(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
                 }
                 break;
             }
-            // At this empty square, try turning 90 degrees
             let turn_dirs = match mv.hook {
                 Some(HookType::Orthogonal) => {
                     if d == N || d == S { vec![E, W] } else { vec![N, S] }
@@ -390,10 +383,8 @@ fn gen_area(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
         let t1 = board.cells[sq1];
         if t1 != EMPTY_CELL && cell_color(t1) == color { continue; }
 
-        // First step destination
         add_move(moves, sq as u16, sq1 as u16, pt, color, t1);
 
-        // Second step
         if mv.area >= 2 {
             for d2 in 0..NUM_DIRS {
                 let (dr2, dc2) = get_deltas(d2, color);
@@ -401,12 +392,11 @@ fn gen_area(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
                 let c2 = c1 + dc2;
                 if r2 < 0 || r2 >= BOARD_SIZE as i32 || c2 < 0 || c2 >= BOARD_SIZE as i32 { continue; }
                 let sq2 = r2 as usize * BOARD_SIZE + c2 as usize;
-                if sq2 == sq { continue; } // back to start
+                if sq2 == sq { continue; }
                 let t2 = board.cells[sq2];
                 if t2 != EMPTY_CELL && cell_color(t2) == color { continue; }
 
                 if t1 != EMPTY_CELL && cell_color(t1) != color {
-                    // Captured at midpoint
                     let mut m = Move::simple(sq as u16, sq2 as u16);
                     m.mid_sq = sq1 as u16;
                     m.mid_piece = cell_piece(t1);
@@ -444,9 +434,7 @@ fn gen_range_capture(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
                 let t_pt = cell_piece(target);
                 let t_rank = pieces::rank(t_pt);
                 if t_rank > piece_rank {
-                    // Lower rank: capture and continue
                     captured_list.push((rsq, t_pt, cell_color(target)));
-                    // Apply zone-based promotion logic for range capture
                     let from_in = in_promo_zone(sq, color);
                     let to_in = in_promo_zone(rsq as usize, color);
                     let may_promo = can_promote(pt) && (
@@ -462,7 +450,6 @@ fn gen_range_capture(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
                         m.promotion = true;
                         moves.push(m);
                     } else if may_promo {
-                        // Both options
                         let mut m1 = Move::simple(sq as u16, rsq);
                         m1.captured_piece = t_pt;
                         m1.captured_color = cell_color(target);
@@ -482,7 +469,7 @@ fn gen_range_capture(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
                         moves.push(m);
                     }
                 } else {
-                    break; // blocked by equal or higher rank
+                    break;
                 }
             }
         }
@@ -494,11 +481,9 @@ fn gen_igui(board: &Board, sq: usize, pt: u16, color: u8, moves: &mut Vec<Move>)
         if let Some(nsq) = step_sq(sq, d, color) {
             let target = board.cells[nsq];
             if target != EMPTY_CELL && cell_color(target) != color {
-                // Igui is a capture in place — zone promotion applies if piece is in zone
                 let in_zone = in_promo_zone(sq, color);
                 let may_promo = can_promote(pt) && in_zone;
                 if may_promo {
-                    // Both options (never forced since piece doesn't move to farthest rank)
                     let mut m1 = Move::simple(sq as u16, sq as u16);
                     m1.captured_piece = cell_piece(target);
                     m1.captured_color = cell_color(target);
