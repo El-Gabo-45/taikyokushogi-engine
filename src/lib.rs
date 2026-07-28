@@ -43,8 +43,10 @@ mod pieces;
 mod board;
 mod movegen;
 mod eval;
-mod search;
+pub mod search;
 mod tsfen;
+mod bitboard;
+mod debugging;
 pub mod selfplay;
 
 #[cfg(feature = "python")]

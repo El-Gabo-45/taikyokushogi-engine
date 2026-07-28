@@ -1,5 +1,7 @@
 use crate::types::*;
 use crate::pieces;
+use crate::bitboard::Bitboard1296;
+use crate::bitboard::U64_COUNT;
 
 pub struct Board {
     pub cells: [Cell; NUM_SQUARES],
@@ -20,6 +22,10 @@ pub struct Board {
     pub hash: u64,
     // Undo stack
     history: Vec<UndoInfo>,
+    // ── BITBOARD OCCUPANCY ────────────────────────────────────────
+    // Occupancy per color: fast attack generation and check detection
+    pub occupancy: [Bitboard1296; 2],  // [0]=BLACK, [1]=WHITE
+    pub all_occupancy: Bitboard1296,
 }
 
 impl Clone for Board {
@@ -37,6 +43,8 @@ impl Clone for Board {
             piece_index: self.piece_index,
             hash: self.hash,
             history: self.history.clone(),
+            occupancy: self.occupancy,
+            all_occupancy: self.all_occupancy,
         }
     }
 }
@@ -56,6 +64,8 @@ impl Board {
             piece_index: [INVALID_SQ; NUM_SQUARES],
             hash: 0,
             history: Vec::new(),
+            occupancy: [Bitboard1296::new(), Bitboard1296::new()],
+            all_occupancy: Bitboard1296::new(),
         }
     }
 
@@ -72,6 +82,8 @@ impl Board {
         self.piece_index = [INVALID_SQ; NUM_SQUARES];
         self.hash = 0;
         self.history.clear();
+        self.occupancy = [Bitboard1296::new(), Bitboard1296::new()];
+        self.all_occupancy = Bitboard1296::new();
 
         // Place Black's pieces (rows 24-35)
         for (rank_idx, rank_str) in pieces::SETUP_RANKS.iter().enumerate() {
@@ -107,6 +119,10 @@ impl Board {
         self.piece_list[c][idx] = sq as u16;
         self.piece_list_len[c] = idx + 1;
         self.piece_count[c] += 1;
+
+        // Update bitboards
+        self.occupancy[c].set_usize(sq);
+        self.all_occupancy.set_usize(sq);
 
         if pieces::is_royal(pt) {
             let ri = self.royal_count[c];
@@ -210,6 +226,9 @@ impl Board {
         self.hash ^= zobrist_piece_key(pt, from, color);
         self.cells[from] = EMPTY_CELL;
         self.remove_sq_from_piece_list(from, c);
+        // Update bitboards for from-square
+        self.occupancy[c].clear_usize(from);
+        self.all_occupancy.clear_usize(from);
         if pieces::is_royal(pt) {
             self.remove_sq_from_royal_list(from, c);
         }
@@ -219,6 +238,7 @@ impl Board {
             self.hash ^= zobrist_piece_key(
                 cell_piece(to_cell), to, cell_color(to_cell));
             self.remove_from_lists(to);
+            // Bitboard cleanup for captured piece is handled in remove_from_lists
         }
 
         let final_pt = if m.promotion {
@@ -231,6 +251,9 @@ impl Board {
         self.hash ^= zobrist_piece_key(final_pt, to, color);
         self.cells[to] = make_cell(final_pt, color);
         self.add_sq_to_piece_list(to, c);
+        // Update bitboards for to-square
+        self.occupancy[c].set_usize(to);
+        self.all_occupancy.set_usize(to);
         if pieces::is_royal(final_pt) {
             let ri = self.royal_count[c];
             self.royal_list[c][ri] = to as u16;
@@ -269,13 +292,15 @@ impl Board {
 
         // ── Incremental undo ─────────────────────────────────────────────
 
-        // 1. Remove piece from destination (where apply put it)
-        //    remove_sq_from_piece_list does the swap+decrement in O(1)
+        // 1. Remove piece from destination
         let dest_cell = self.cells[to];
         if dest_cell != EMPTY_CELL {
             let dest_pt = cell_piece(dest_cell);
             let dest_c = cell_color(dest_cell) as usize;
             self.remove_sq_from_piece_list(to, dest_c);
+            // Update bitboards
+            self.occupancy[dest_c].clear_usize(to);
+            self.all_occupancy.clear_usize(to);
             if pieces::is_royal(dest_pt) { self.remove_sq_from_royal_list(to, dest_c); }
             self.cells[to] = EMPTY_CELL;
         }
@@ -285,6 +310,9 @@ impl Board {
         let orig_c = cell_color(undo.from_cell) as usize;
         self.cells[from] = undo.from_cell;
         self.add_sq_to_piece_list(from, orig_c);
+        // Update bitboards
+        self.occupancy[orig_c].set_usize(from);
+        self.all_occupancy.set_usize(from);
         if pieces::is_royal(orig_pt) {
             self.royal_list[orig_c][self.royal_count[orig_c]] = from as u16;
             self.royal_count[orig_c] += 1;
@@ -296,6 +324,9 @@ impl Board {
             let cap_c = cell_color(undo.to_cell) as usize;
             self.cells[to] = undo.to_cell;
             self.add_sq_to_piece_list(to, cap_c);
+            // Update bitboards
+            self.occupancy[cap_c].set_usize(to);
+            self.all_occupancy.set_usize(to);
             if pieces::is_royal(cap_pt) {
                 self.royal_list[cap_c][self.royal_count[cap_c]] = to as u16;
                 self.royal_count[cap_c] += 1;
@@ -309,6 +340,8 @@ impl Board {
             let mid_c = cell_color(undo.mid_cell) as usize;
             self.cells[msq] = undo.mid_cell;
             self.add_sq_to_piece_list(msq, mid_c);
+            self.occupancy[mid_c].set_usize(msq);
+            self.all_occupancy.set_usize(msq);
             if pieces::is_royal(mid_pt) {
                 self.royal_list[mid_c][self.royal_count[mid_c]] = msq as u16;
                 self.royal_count[mid_c] += 1;
@@ -324,6 +357,8 @@ impl Board {
                     let cap_c = cell_color(cell) as usize;
                     self.cells[squ] = cell;
                     self.add_sq_to_piece_list(squ, cap_c);
+                    self.occupancy[cap_c].set_usize(squ);
+                    self.all_occupancy.set_usize(squ);
                     if pieces::is_royal(cap_pt) {
                         self.royal_list[cap_c][self.royal_count[cap_c]] = sq;
                         self.royal_count[cap_c] += 1;
@@ -343,6 +378,8 @@ impl Board {
         self.piece_list_len = [0; 2];
         self.piece_count = [0; 2];
         self.royal_count = [0; 2];
+        self.occupancy = [Bitboard1296::new(), Bitboard1296::new()];
+        self.all_occupancy = Bitboard1296::new();
 
         for sq in 0..NUM_SQUARES {
             let cell = self.cells[sq];
@@ -355,6 +392,8 @@ impl Board {
                 self.piece_list[c][idx] = sq as u16;
                 self.piece_list_len[c] = idx + 1;
                 self.piece_count[c] += 1;
+                self.occupancy[c].set_usize(sq);
+                self.all_occupancy.set_usize(sq);
                 if pieces::is_royal(pt) {
                     let ri = self.royal_count[c];
                     self.royal_list[c][ri] = sq as u16;
@@ -372,7 +411,10 @@ impl Board {
         if cell == EMPTY_CELL { return; }
         let pt = cell_piece(cell);
         let color = cell_color(cell) as usize;
-        self.remove_sq_from_piece_list(sq, color); // also decrements piece_count
+        // Update bitboards BEFORE removing from list (we need cell info)
+        self.occupancy[color].clear_usize(sq);
+        self.all_occupancy.clear_usize(sq);
+        self.remove_sq_from_piece_list(sq, color);
         if pieces::is_royal(pt) {
             self.remove_sq_from_royal_list(sq, color);
         }
@@ -383,7 +425,6 @@ impl Board {
         let idx = self.piece_index[sq] as usize;
         let len = self.piece_list_len[color];
         if idx >= len { return; }
-        // Swap with last
         let last_sq = self.piece_list[color][len - 1] as usize;
         self.piece_list[color][idx] = last_sq as u16;
         self.piece_index[last_sq] = idx as u16;

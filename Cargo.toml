@@ -20,6 +20,9 @@ crate-type = ["lib", "cdylib"]
 name = "taikyokushogi-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "debug-cli"
+path = "src/debug_cli.rs"
 
 [features]
 default = ["cpu"]

@@ -27,14 +27,21 @@ impl Default for SelfPlayConfig {
         Self {
             num_games: 4,
             num_workers: 2,
-            depth: 1,
-            time_limit_ms: 0,
-            max_moves: 200,
+            depth: 2,
+            time_limit_ms: 500,
+            max_moves: 0,
             output_dir: "training_data".to_string(),
             save_interval: 100,
             sqlite_path: Some("training_data/games.db".to_string()),
         }
     }
+}
+
+fn should_stop_game(move_count: u32, max_moves: u32, terminal: Option<GameResult>) -> bool {
+    if terminal.is_some() {
+        return true;
+    }
+    max_moves > 0 && move_count >= max_moves
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -118,16 +125,13 @@ impl SelfPlayWorker {
         let mut result_val: i8 = 0;
 
         loop {
-            if move_count >= self.config.max_moves {
-                result_val = 0;
-                break;
-            }
-
-            if let Some(result) = board.game_result() {
-                result_val = match result {
-                    GameResult::BlackWins => 1i8,
-                    GameResult::WhiteWins => -1i8,
-                    GameResult::Draw => 0i8,
+            let terminal = board.game_result();
+            if should_stop_game(move_count, self.config.max_moves, terminal) {
+                result_val = match terminal {
+                    Some(GameResult::BlackWins) => 1i8,
+                    Some(GameResult::WhiteWins) => -1i8,
+                    Some(GameResult::Draw) => 0i8,
+                    None => 0i8,
                 };
                 break;
             }
@@ -173,8 +177,9 @@ impl SelfPlayWorker {
                     sample.board[sq] = cell_piece(cell) | ((cell_color(cell) as u16) << 8);
                 }
             }
-            let moves = generate_legal_moves(&board);
-            for (idx, m) in moves.iter().enumerate() {
+            // Use pseudo-legal moves for policy target (much faster than generate_legal_moves)
+            let pseudo_moves = crate::movegen::generate_pseudo_legal_moves(&board);
+            for (idx, m) in pseudo_moves.iter().enumerate() {
                 if m.from_sq == best_move.from_sq && m.to_sq == best_move.to_sq && m.promotion == best_move.promotion {
                     sample.policy_target = idx as u16;
                     break;
@@ -233,6 +238,27 @@ impl SelfPlayWorker {
                 self.id, i + 1, my_count, game_id, n, result_str);
         }
 
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_uses_full_games_and_fast_search() {
+        let cfg = SelfPlayConfig::default();
+        assert_eq!(cfg.max_moves, 0);
+        assert!(cfg.depth >= 2);
+        assert!(cfg.time_limit_ms > 0);
+    }
+
+    #[test]
+    fn stop_condition_respects_unbounded_mode() {
+        assert!(!should_stop_game(1000, 0, None));
+        assert!(should_stop_game(1000, 10, None));
+        assert!(should_stop_game(10, 10, None));
+        assert!(should_stop_game(5, 10, Some(GameResult::Draw)));
     }
 }
 
@@ -411,8 +437,9 @@ impl SelfPlayCoordinator {
 
 pub fn run_selfplay(config: Option<SelfPlayConfig>) {
     let config = config.unwrap_or_default();
+    let max_moves = if config.max_moves == 0 { "unlimited".to_string() } else { config.max_moves.to_string() };
     println!("Starting self-play: {} games, {} workers, depth={}, max_moves={}",
-        config.num_games, config.num_workers, config.depth, config.max_moves);
+        config.num_games, config.num_workers, config.depth, max_moves);
     let mut coord = SelfPlayCoordinator::new(config);
     coord.start();
     coord.wait();

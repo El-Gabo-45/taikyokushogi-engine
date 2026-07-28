@@ -5,17 +5,18 @@ use crate::movegen::generate_pseudo_legal_moves;
 use crate::movegen::is_in_check;
 use crate::eval::{evaluate, material_score, MATE_SCORE};
 use std::sync::atomic::{AtomicU64, AtomicI32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, Arc};
 use std::time::Instant;
+use std::thread;
 
-// ── Transposition Table (4M entries, depth-preferred + generation aging) ─
+// ── Transposition Table ─────────────────────────────────────────
 const TT_SIZE: usize = 1 << 22;
 
 #[derive(Clone, Copy)]
 struct TTEntry {
     score: i32,
     depth: i8,
-    flag: u8,
+    flag: u8,       // 0=EXACT, 1=LOWERBOUND (≥beta), 2=UPPERBOUND (≤alpha)
     generation: u8,
     best_move: u32,
 }
@@ -27,19 +28,14 @@ fn tt() -> &'static Vec<AtomicU64> {
 }
 
 #[inline]
-fn tt_index(hash: u64) -> usize {
-    (hash as usize) & (TT_SIZE - 1)
-}
+fn tt_index(hash: u64) -> usize { (hash as usize) & (TT_SIZE - 1) }
 
 #[inline]
-fn tt_pack_entry(entry: &TTEntry, generation: u8) -> u64 {
-    let score_clamped = entry.score.clamp(-32000, 32000) as i16 as u16;
+fn tt_pack(entry: &TTEntry, gen: u8) -> u64 {
+    let sc = entry.score.clamp(-32000, 32000) as i16 as u16;
     let mv16 = (entry.best_move & 0xFFFF) as u16;
-    ((score_clamped as u64) << 32)
-        | ((entry.depth as u64 & 0x7F) << 25)
-        | ((entry.flag as u64) << 16)
-        | ((generation as u64) << 8)
-        | (mv16 as u64)
+    ((sc as u64) << 32) | ((entry.depth as u64 & 0x7F) << 25)
+        | ((entry.flag as u64) << 16) | ((gen as u64) << 8) | (mv16 as u64)
 }
 
 #[inline]
@@ -53,21 +49,16 @@ fn tt_unpack(packed: u64) -> TTEntry {
     }
 }
 
-static TT_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-fn tt_generation() -> u8 {
-    (TT_GENERATION.load(Ordering::Relaxed) & 0xFF) as u8
-}
+static TT_GEN: AtomicU64 = AtomicU64::new(1);
+fn tt_gen() -> u8 { (TT_GEN.load(Ordering::Relaxed) & 0xFF) as u8 }
 
 fn tt_probe(hash: u64) -> Option<(TTEntry, u32)> {
     let idx = tt_index(hash) * 2;
     let t = tt();
-    let stored_hash = t[idx].load(Ordering::Relaxed);
-    if stored_hash == hash {
+    let stored = t[idx].load(Ordering::Relaxed);
+    if stored == hash {
         let entry = tt_unpack(t[idx + 1].load(Ordering::Relaxed));
-        if entry.depth >= 0 {
-            return Some((entry, entry.best_move));
-        }
+        if entry.depth >= 0 { return Some((entry, entry.best_move)); }
     }
     None
 }
@@ -75,56 +66,48 @@ fn tt_probe(hash: u64) -> Option<(TTEntry, u32)> {
 fn tt_store(hash: u64, entry: TTEntry) {
     let idx = tt_index(hash) * 2;
     let t = tt();
-    let gen = tt_generation();
+    let gen = tt_gen();
     let old_hash = t[idx].load(Ordering::Relaxed);
-    let old_data = t[idx + 1].load(Ordering::Relaxed);
-    let old_entry = tt_unpack(old_data);
-    let replace = old_hash == 0
-        || entry.depth > old_entry.depth
-        || (entry.depth == old_entry.depth && gen.wrapping_sub(old_entry.generation) > 100);
+    let old = tt_unpack(t[idx + 1].load(Ordering::Relaxed));
+    let replace = old_hash == 0 || entry.depth > old.depth
+        || (entry.depth == old.depth && gen.wrapping_sub(old.generation) > 100);
     if replace {
         t[idx].store(hash, Ordering::Relaxed);
-        t[idx + 1].store(tt_pack_entry(&entry, gen), Ordering::Relaxed);
+        t[idx + 1].store(tt_pack(&entry, gen), Ordering::Relaxed);
     }
 }
 
-// ── Killers (atomic) ─────────────────────────────────────────────
-static KILLER_MOVES: OnceLock<Vec<AtomicU64>> = OnceLock::new();
-
+// ── Killers ─────────────────────────────────────────────────────
+static KILLERS: OnceLock<Vec<AtomicU64>> = OnceLock::new();
 fn killers() -> &'static Vec<AtomicU64> {
-    KILLER_MOVES.get_or_init(|| (0..256).map(|_| AtomicU64::new(0)).collect())
+    KILLERS.get_or_init(|| (0..256).map(|_| AtomicU64::new(0)).collect())
 }
 
 fn killer_store(depth: u32, mv: u32) {
     let d = depth.min(127) as usize;
     let slot = &killers()[d];
-    let current = slot.load(Ordering::Relaxed);
-    let mv0 = current as u32;
-    if mv != mv0 {
-        slot.store(mv as u64 | ((mv0 as u64) << 32), Ordering::Relaxed);
-    }
+    let cur = slot.load(Ordering::Relaxed);
+    let mv0 = cur as u32;
+    if mv != mv0 { slot.store(mv as u64 | ((mv0 as u64) << 32), Ordering::Relaxed); }
 }
 
 fn killer_score(depth: u32, mv: u32) -> i32 {
     let d = depth.min(127) as usize;
-    let packed = killers()[d].load(Ordering::Relaxed);
-    let mv0 = packed as u32;
-    let mv1 = (packed >> 32) as u32;
-    if mv == mv0 { 90000 }
-    else if mv == mv1 { 80000 }
-    else { 0 }
+    let p = killers()[d].load(Ordering::Relaxed);
+    let mv0 = p as u32;
+    let mv1 = (p >> 32) as u32;
+    if mv == mv0 { 90000 } else if mv == mv1 { 80000 } else { 0 }
 }
 
-// ── History (AtomicI32) ──────────────────────────────────────────
-const HIST_SIZE: usize = 256;
-static HISTORY: OnceLock<Vec<AtomicI32>> = OnceLock::new();
-
+// ── History ─────────────────────────────────────────────────────
+const HIST_SZ: usize = 256;
+static HIST: OnceLock<Vec<AtomicI32>> = OnceLock::new();
 fn history() -> &'static Vec<AtomicI32> {
-    HISTORY.get_or_init(|| (0..HIST_SIZE * HIST_SIZE).map(|_| AtomicI32::new(0)).collect())
+    HIST.get_or_init(|| (0..HIST_SZ * HIST_SZ).map(|_| AtomicI32::new(0)).collect())
 }
 
 fn history_store(from: usize, to: usize, depth: u32) {
-    let idx = (from % HIST_SIZE) * HIST_SIZE + (to % HIST_SIZE);
+    let idx = (from % HIST_SZ) * HIST_SZ + (to % HIST_SZ);
     let bonus = (depth * depth).min(400) as i32;
     history()[idx].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_add(bonus).min(32767))
@@ -132,56 +115,40 @@ fn history_store(from: usize, to: usize, depth: u32) {
 }
 
 fn history_score(from: usize, to: usize) -> i32 {
-    let idx = (from % HIST_SIZE) * HIST_SIZE + (to % HIST_SIZE);
+    let idx = (from % HIST_SZ) * HIST_SZ + (to % HIST_SZ);
     history()[idx].load(Ordering::Relaxed)
 }
 
 fn history_clear() {
-    if let Some(h) = HISTORY.get() {
-        for cell in h.iter() {
-            cell.store(0, Ordering::Relaxed);
-        }
-    }
-    counter_move_clear();
-    TT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if let Some(h) = HIST.get() { for cell in h { cell.store(0, Ordering::Relaxed); } }
+    counter_clear();
+    TT_GEN.fetch_add(1, Ordering::Relaxed);
 }
 
-// ── Counter Move Heuristic ───────────────────────────────────────
-// For (move, depth) store a "counter move" that refuted it
-static COUNTER_MOVES: OnceLock<Vec<AtomicU64>> = OnceLock::new();
-
-fn counter_moves() -> &'static Vec<AtomicU64> {
-    COUNTER_MOVES.get_or_init(|| (0..65536).map(|_| AtomicU64::new(0)).collect())
+// ── Counter Move ────────────────────────────────────────────────
+static COUNTER: OnceLock<Vec<AtomicU64>> = OnceLock::new();
+fn counter() -> &'static Vec<AtomicU64> {
+    COUNTER.get_or_init(|| (0..65536).map(|_| AtomicU64::new(0)).collect())
 }
-
-fn counter_move_store(prev_move: u32, counter: u32) {
-    let idx = (prev_move as usize) & 0xFFFF;
-    counter_moves()[idx].store(counter as u64, Ordering::Relaxed);
+fn counter_store(prev: u32, mv: u32) {
+    counter()[(prev as usize) & 0xFFFF].store(mv as u64, Ordering::Relaxed);
 }
-
-fn counter_move_score(prev_move: u32, mv: u32) -> i32 {
-    let idx = (prev_move as usize) & 0xFFFF;
-    let stored = counter_moves()[idx].load(Ordering::Relaxed) as u32;
+fn counter_score(prev: u32, mv: u32) -> i32 {
+    if prev == 0 { return 0; }
+    let stored = counter()[(prev as usize) & 0xFFFF].load(Ordering::Relaxed) as u32;
     if stored == mv { 70000 } else { 0 }
 }
-
-fn counter_move_clear() {
-    if let Some(h) = COUNTER_MOVES.get() {
-        for cell in h.iter() {
-            cell.store(0, Ordering::Relaxed);
-        }
-    }
+fn counter_clear() {
+    if let Some(c) = COUNTER.get() { for cell in c { cell.store(0, Ordering::Relaxed); } }
 }
 
-// ── Precomputed piece values ─────────────────────────────────────
-fn init_piece_values() -> &'static [i32; 512] {
-    static VALS: OnceLock<[i32; 512]> = OnceLock::new();
-    VALS.get_or_init(|| {
-        let mut vals = [0i32; 512];
-        for pt in 1..=301u16 {
-            vals[pt as usize] = pieces::value(pt);
-        }
-        vals
+// ── Piece values ────────────────────────────────────────────────
+fn piece_vals() -> &'static [i32; 512] {
+    static V: OnceLock<[i32; 512]> = OnceLock::new();
+    V.get_or_init(|| {
+        let mut v = [0i32; 512];
+        for pt in 1..=301u16 { v[pt as usize] = pieces::value(pt); }
+        v
     })
 }
 
@@ -201,66 +168,31 @@ fn is_tactical(m: &Move) -> bool {
     m.captured_piece != 0 || m.mid_piece != 0 || m.promotion || m.range_caps.is_some()
 }
 
-fn move_order_score(m: &Move) -> i32 {
-    let vals = init_piece_values();
-    let mut score = 0i32;
-    if m.captured_piece != 0 { score += vals[m.captured_piece as usize] * 10; }
-    if m.promotion { score += 5000; }
-    if m.mid_piece != 0 { score += vals[m.mid_piece as usize] * 5; }
-    if let Some(ref caps) = m.range_caps {
-        for &(_, pt, _) in caps { score += vals[pt as usize] * 10; }
-    }
-    score
-}
+// ── Move ordering ───────────────────────────────────────────────
+// Priority: 1) Hash move (TT)  2) MVV-LVA captures  3) Killers  4) History  5) Counter
 
-// ── Move Grouping ────────────────────────────────────────────────
-// Split moves into tactical (must-see) and quiet (can be pruned)
-struct MoveGroups {
-    tactical: Vec<(i32, usize, u32)>, // (score, index, packed)
-    quiet: Vec<(i32, usize, u32)>,
-}
-
-fn group_moves<'a>(moves: &'a [Move], scored: &[(i32, usize)],
-                   depth: u32, iid_move: u32, tt_best: u32,
-                   prev_move: u32) -> MoveGroups {
-    let mut tactical = Vec::with_capacity(scored.len().min(32));
-    let mut quiet = Vec::with_capacity(scored.len().min(32));
-
-    for &(base_score, idx) in scored {
-        let m = &moves[idx];
-        let packed = m_pack(m);
-        let mut score = base_score;
-        if packed == iid_move { score += 2_000_000; }
-        if packed == tt_best { score += 1_000_000; }
-        score += killer_score(depth, packed);
-        score += history_score(m.from_sq as usize, m.to_sq as usize);
-        score += counter_move_score(prev_move, packed);
-
-        if is_tactical(m) {
-            tactical.push((score, idx, packed));
-        } else {
-            quiet.push((score, idx, packed));
+// ── Move ordering ───────────────────────────────────────────────
+fn score_move(m: &Move, tt_move: u32, killer: u32, hist: i32, cntr: i32) -> i32 {
+    let packed = m_pack(m);
+    // 1) Hash move (from TT)
+    if packed == tt_move { return 2_000_000; }
+    // 2) Captures: MVV-LVA
+    if is_tactical(m) {
+        let vals = piece_vals();
+        let mut score = 1_000_000;
+        if m.captured_piece != 0 { score += vals[m.captured_piece as usize] * 100; }
+        if m.mid_piece != 0 { score += vals[m.mid_piece as usize] * 100; }
+        if let Some(ref caps) = m.range_caps {
+            for &(_, pt, _) in caps { score += vals[pt as usize] * 100; }
         }
+        if m.promotion { score += 5000; }
+        return score;
     }
-    // Both groups already sorted by the caller's sort
-    MoveGroups { tactical, quiet }
-}
-
-// ── Beam Width Calculator (Progressive Widening) ────────────────
-// Returns beam width for a given depth and move index.
-// The beam widens as depth decreases (we're closer to root).
-fn beam_width(effective_depth: u32, move_idx: usize, fail_low: bool) -> usize {
-    let base = if effective_depth <= 1 { 8 }
-        else if effective_depth <= 2 { 6 }
-        else if effective_depth <= 4 { 4 }
-        else { 3 };
-    
-    // If we failed low (alpha wasn't raised), widen the beam
-    let widened = if fail_low { base * 2 } else { base };
-    
-    // Progressive widening: for moves beyond the beam, we still search
-    // but with reduced depth (handled by LMR)
-    widened
+    // 3) Killer moves
+    if packed == killer { return 90000; }
+    // 4) History heuristic
+    // 5) Counter move heuristic
+    hist + cntr
 }
 
 // ── Public Search ──────────────────────────────────────────────
@@ -268,351 +200,341 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
     let start = Instant::now();
     let deadline = if time_limit_ms > 0 {
         Some(start + std::time::Duration::from_millis(time_limit_ms))
-    } else {
-        None
-    };
+    } else { None };
 
+    piece_vals();
     let mut best_move = None;
     let mut best_score = -MATE_SCORE - 1;
     let mut nodes: u64 = 0;
-
-    init_piece_values();
 
     let moves = generate_pseudo_legal_moves(board);
     if moves.is_empty() {
         return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
     }
 
-    let mut scored_moves: Vec<(i32, usize)> = moves.iter().enumerate()
-        .map(|(i, m)| (move_order_score(m), i))
+    // Score and sort root moves
+    let mut scored: Vec<(i32, usize)> = moves.iter().enumerate()
+        .map(|(i, m)| (score_move(m, 0, 0, 0, 0), i))
         .collect();
-    scored_moves.sort_by(|a, b| b.0.cmp(&a.0));
-
-    let beam = if depth <= 1 { moves.len() } else { 64 };
-    let max_moves = beam.min(moves.len());
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    let max_moves = if depth <= 1 { moves.len() } else { moves.len().min(64) };
 
     if depth <= 1 {
-        // Fast material-delta for depth-1
         let base_mat = material_score(board);
         for rank in 0..max_moves {
-            let idx = scored_moves[rank].1;
+            let idx = scored[rank].1;
             let m = &moves[idx];
             nodes += 1;
             let mut delta = 0i32;
             let sign = if board.side_to_move == BLACK { 1 } else { -1 };
             if m.promotion {
                 let pt = cell_piece(board.cells[m.from_sq as usize]);
-                if let Some(promo_pt) = pieces::promotes_to(pt) {
-                    let vals = init_piece_values();
-                    delta += sign * (vals[promo_pt as usize] - vals[pt as usize]);
+                if let Some(p) = pieces::promotes_to(pt) {
+                    let v = piece_vals();
+                    delta += sign * (v[p as usize] - v[pt as usize]);
                 }
             }
-            let vals = init_piece_values();
-            if m.captured_piece != 0 { delta += sign * vals[m.captured_piece as usize]; }
-            if m.mid_piece != 0 { delta += sign * vals[m.mid_piece as usize]; }
+            let v = piece_vals();
+            if m.captured_piece != 0 { delta += sign * v[m.captured_piece as usize]; }
+            if m.mid_piece != 0 { delta += sign * v[m.mid_piece as usize]; }
             if let Some(ref caps) = m.range_caps {
-                for &(_, pt, _) in caps { delta += sign * vals[pt as usize]; }
+                for &(_, pt, _) in caps { delta += sign * v[pt as usize]; }
             }
-            let score = -(base_mat + delta);
-            if score > best_score { best_score = score; best_move = Some(m.clone()); }
+            let s = -(base_mat + delta);
+            if s > best_score { best_score = s; best_move = Some(m.clone()); }
         }
     } else {
         // Seed TT
         if depth > 2 {
-            let _ = alphabeta(board, depth - 2, -MATE_SCORE - 1, MATE_SCORE + 1,
-                             &mut nodes, deadline, 0, false, 0);
+            let _ = pvs(board, depth - 2, -MATE_SCORE - 1, MATE_SCORE + 1,
+                        &mut nodes, deadline, 0, true, 0);
         }
 
-        let mut prev_root_packed = 0u32;
+        // Lazy SMP helpers
+        let num_helpers = if depth >= 4 && time_limit_ms > 100 {
+            let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            (cpus.min(4)).saturating_sub(1)
+        } else { 0 };
+
+        let shared_nodes = if num_helpers > 0 { Some(Arc::new(AtomicU64::new(0))) } else { None };
+        let mut handles = Vec::new();
+        if let Some(sn) = &shared_nodes {
+            for _ in 0..num_helpers {
+                let mut hb = board.clone();
+                let sn = Arc::clone(sn);
+                let dl = deadline;
+                handles.push(thread::spawn(move || {
+                    let mut hn = 0u64;
+                    let _ = pvs(&mut hb, depth - 1, -MATE_SCORE - 1, MATE_SCORE + 1,
+                                &mut hn, dl, 0, true, 0);
+                    sn.fetch_add(hn, Ordering::Relaxed);
+                }));
+            }
+        }
+
+        // Root search with aspiration windows
         for rank in 0..max_moves {
-            let idx = scored_moves[rank].1;
+            let idx = scored[rank].1;
             let m = &moves[idx];
 
             board.apply_move(m);
-            if is_in_check(board) {
-                board.undo_move();
-                continue;
-            }
+            if is_in_check(board) { board.undo_move(); continue; }
             nodes += 1;
 
-            // Aspiration windows
             let (sa, sb) = if depth > 3 && rank == 0 && best_score > -MATE_SCORE + 100 {
                 (best_score - 50, best_score + 50)
             } else {
                 (-MATE_SCORE - 1, -best_score.max(-MATE_SCORE - 1))
             };
 
-            let score = -alphabeta(board, depth - 1, sa, sb, &mut nodes, deadline, 0, false, m_pack(m));
+            // PVS at root: first move full window, rest with null window
+            let score = if rank == 0 {
+                -pvs(board, depth - 1, sa, sb, &mut nodes, deadline, 0, true, m_pack(m))
+            } else {
+                // Null-window search (egaScout)
+                let nw = -pvs(board, depth - 1, -sa - 1, -sa, &mut nodes, deadline, 0, true, m_pack(m));
+                if nw > sa && nw < sb {
+                    -pvs(board, depth - 1, -sb, -sa, &mut nodes, deadline, 0, true, m_pack(m))
+                } else { nw }
+            };
 
             // Research if aspiration failed
             if score <= sa || score >= sb {
-                let full = -alphabeta(board, depth - 1, -MATE_SCORE - 1,
-                                      -best_score.max(-MATE_SCORE - 1),
-                                      &mut nodes, deadline, 0, false, m_pack(m));
+                let full = -pvs(board, depth - 1, -MATE_SCORE - 1,
+                                -best_score.max(-MATE_SCORE - 1),
+                                &mut nodes, deadline, 0, true, m_pack(m));
                 if full > best_score { best_score = full; best_move = Some(m.clone()); }
             } else if score > best_score {
                 best_score = score;
                 best_move = Some(m.clone());
-                prev_root_packed = m_pack(m);
             }
 
             board.undo_move();
-            if let Some(dl) = deadline {
-                if Instant::now() >= dl { break; }
-            }
+            if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
         }
+
+        for h in handles { h.join().ok(); }
+        if let Some(sn) = shared_nodes { nodes += sn.load(Ordering::Relaxed); }
     }
 
     let elapsed = start.elapsed().as_millis() as u64;
     SearchResult { best_move, score: best_score, nodes, time_ms: elapsed }
 }
 
-// ── Alpha-Beta with Advanced Pruning ──────────────────────────
-fn alphabeta(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
-             nodes: &mut u64, deadline: Option<Instant>, ply: u32,
-             prune_hard: bool, prev_move: u32) -> i32 {
+// ── PVS (Principal Variation Search) with egaScout ─────────────
+// This is the core search function implementing:
+// - PVS/egaScout: full window for first move, null window for rest
+// - NMP: Null Move Pruning (R=2 or R=3)
+// - RFP: Reverse Futility Pruning
+// - Razoring
+// - IID: Internal Iterative Deepening
+// - LMR: Late Move Reduction
+// - LMP: Late Move Pruning
+fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
+       nodes: &mut u64, deadline: Option<Instant>, ply: u32,
+       pruning: bool, prev_move: u32) -> i32 {
     *nodes += 1;
 
+    // Time check
     if *nodes & 8191 == 0 {
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl { return alpha; }
-        }
+        if let Some(dl) = deadline { if Instant::now() >= dl { return alpha; } }
     }
 
+    // Terminal check
     if let Some(result) = board.game_result() {
         return match result {
-            GameResult::BlackWins  => if board.side_to_move == BLACK { MATE_SCORE - ply as i32 } else { -(MATE_SCORE - ply as i32) },
-            GameResult::WhiteWins  => if board.side_to_move == WHITE { MATE_SCORE - ply as i32 } else { -(MATE_SCORE - ply as i32) },
-            GameResult::Draw       => 0,
+            GameResult::BlackWins => if board.side_to_move == BLACK { MATE_SCORE - ply as i32 } else { -(MATE_SCORE - ply as i32) },
+            GameResult::WhiteWins => if board.side_to_move == WHITE { MATE_SCORE - ply as i32 } else { -(MATE_SCORE - ply as i32) },
+            GameResult::Draw => 0,
         };
     }
 
+    // Check extension
     let in_check = is_in_check(board);
-    let ext = if in_check && prune_hard { 1 } else { 0 };
-    let effective_depth = depth + ext;
+    let ext = if in_check && pruning { 1 } else { 0 };
+    let d = depth + ext; // effective depth
 
+    // ── TT PROBE ──────────────────────────────────────────────
     let hash = board.hash;
-    let tt_best_move = if let Some((entry, best_mv)) = tt_probe(hash) {
-        if (entry.depth as u32) >= effective_depth {
+    let tt_move = if let Some((entry, best_mv)) = tt_probe(hash) {
+        if (entry.depth as u32) >= d {
             match entry.flag {
                 0 => return entry.score,
-                1 => { if entry.score >= beta  { return entry.score; } }
-                2 => { if entry.score <= alpha { return entry.score; } }
+                1 => if entry.score >= beta { return entry.score; },
+                2 => if entry.score <= alpha { return entry.score; },
                 _ => {}
             }
         }
         best_mv
     } else { 0 };
 
-    if effective_depth == 0 {
-        let total_pieces = board.piece_count[0] + board.piece_count[1];
-        if total_pieces < 200 { return quiescence(board, alpha, beta, nodes, deadline); }
+    // ── QUIESCENCE ────────────────────────────────────────────
+    if d == 0 {
+        let total = board.piece_count[0] + board.piece_count[1];
+        if total < 200 { return quiescence(board, alpha, beta, nodes, deadline); }
         return evaluate(board);
     }
 
-    // ── Razoring / RFP ──────────────────────────────────────
-    if prune_hard && effective_depth <= 2 && !in_check {
-        let static_eval = evaluate(board);
-        if static_eval + 300 + 200 * effective_depth as i32 <= alpha { return alpha; }
-        if static_eval - 250 * effective_depth as i32 >= beta { return beta; }
-    }
-    if prune_hard && depth <= 3 && !in_check && alpha > -MATE_SCORE + 100 {
-        let static_eval = evaluate(board);
-        if static_eval + 300 + 200 * depth as i32 <= alpha { return alpha; }
+    // ── STATIC EVAL ───────────────────────────────────────────
+    let static_eval = evaluate(board);
+
+    // ── RAZORING (depth ≤ 2) ──────────────────────────────────
+    // If static_eval + huge_margin ≤ alpha, prune the node entirely
+    if pruning && d <= 2 && !in_check && alpha > -MATE_SCORE + 100 {
+        let margin = match d { 0 => 400, 1 => 600, _ => 900 };
+        if static_eval + margin <= alpha { return alpha; }
     }
 
-    // ── Null Move Pruning ────────────────────────────────────
+    // ── REVERSE FUTILITY PRUNING (depth ≤ 3) ─────────────────
+    // If static_eval - margin ≥ beta, prune (position is too good)
+    if pruning && d <= 3 && !in_check && alpha > -MATE_SCORE + 100 {
+        let margin = 150 + 250 * d as i32;
+        if static_eval - margin >= beta { return beta; }
+        if static_eval + margin <= alpha { return alpha; }
+    }
+
+    // ── NULL MOVE PRUNING (depth ≥ 3) ─────────────────────────
+    // Give opponent a free move. If even then we're still ≥ beta, prune.
     let side = board.side_to_move as usize;
-    if prune_hard && effective_depth >= 3
-        && board.no_progress_plies < 100
-        && board.piece_count[side] > 3
-        && !in_check
+    if pruning && d >= 3 && board.no_progress_plies < 100
+        && board.piece_count[side] > 3 && !in_check
     {
-        let r = if effective_depth >= 6 { 3 } else { 2 };
+        let r = if d >= 6 { 3 } else { 2 };
         board.null_move();
-        let null_score = -alphabeta(board, effective_depth.saturating_sub(r), -beta, -(beta - 1),
-                                    nodes, deadline, ply + 1, prune_hard, 0);
+        let null_score = -pvs(board, d.saturating_sub(r), -beta, -(beta - 1),
+                              nodes, deadline, ply + 1, pruning, 0);
         board.undo_null_move();
         if null_score >= beta { return beta; }
     }
 
-    // ── IID ──────────────────────────────────────────────────
-    let iid_move = if tt_best_move == 0 && effective_depth >= 4 && prune_hard {
-        let iid_depth = effective_depth / 2 - 1;
-        let _ = alphabeta(board, iid_depth, -beta, -alpha, nodes, deadline, ply, prune_hard, prev_move);
+    // ── INTERNAL ITERATIVE DEEPENING ──────────────────────────
+    // If no TT move, do a shallow search to get one
+    let iid_move = if tt_move == 0 && d >= 4 && pruning {
+        let iid_d = d / 2 - 1;
+        let _ = pvs(board, iid_d, -beta, -alpha, nodes, deadline, ply, pruning, prev_move);
         tt_probe(hash).map(|(_, mv)| mv).unwrap_or(0)
-    } else { tt_best_move };
+    } else { tt_move };
 
-    // ── Generate moves ────────────────────────────────────────
+    // ── GENERATE MOVES ────────────────────────────────────────
     let moves = generate_pseudo_legal_moves(board);
     if moves.is_empty() { return -(MATE_SCORE - ply as i32); }
 
-    // Score and sort
-    let mut scored_moves: Vec<(i32, usize)> = moves.iter().enumerate()
-        .map(|(i, m)| (move_order_score(m), i))
+    // ── MOVE ORDERING ─────────────────────────────────────────
+    // Score each move: hash > MVV-LVA captures > killers > history > counter
+    let killer = {
+        let d_idx = d.min(127) as usize;
+        killers()[d_idx].load(Ordering::Relaxed) as u32
+    };
+
+    let mut scored: Vec<(i32, usize, u32)> = moves.iter().enumerate()
+        .map(|(i, m)| {
+            let packed = m_pack(m);
+            let hist = history_score(m.from_sq as usize, m.to_sq as usize);
+            let cntr = counter_score(prev_move, packed);
+            let s = score_move(m, iid_move, killer, hist, cntr);
+            (s, i, packed)
+        })
         .collect();
-    scored_moves.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // ── Move GROUPING ─────────────────────────────────────────
-    // Separate into tactical (captures/promos) and quiet moves
-    let groups = group_moves(&moves, &scored_moves, effective_depth,
-                             iid_move, tt_best_move, prev_move);
-
-    // ── BEAM SEARCH + PROGRESSIVE WIDENING ───────────────────
-    // Determine beam size. Start narrow, widen if needed.
-    let beam = beam_width(effective_depth, 0, false);
-    let max_tactical = groups.tactical.len().min(beam);
-    let max_quiet = groups.quiet.len().min(beam / 2); // fewer quiet moves
-
-    let mut tt_flag: u8 = 2;
-    let mut best_local: Option<Move> = None;
+    // Separate into tactical and quiet for beam search
+    let beam = if d <= 1 { 8 } else if d <= 2 { 6 } else if d <= 4 { 4 } else { 3 };
+    let mut best: Option<Move> = None;
+    let mut tt_flag: u8 = 2; // UPPERBOUND
     let init_alpha = alpha;
-    let mut fail_low = true; // assume fail-low until we raise alpha
+    let mut searched = false;
 
-    // ── YOUNG BROTHERS WAIT CONCEPT ─────────────────────────
-    // Search tactical moves first. If the first brother (best tactical)
-    // doesn't fail high, the quiet brothers are unlikely to fail high.
-    // Only search quiet moves if tacticals didn't resolve.
-    
-    // Phase 1: Search tactical moves within beam
-    for (move_idx, &(_score, idx, packed)) in groups.tactical[..max_tactical].iter().enumerate() {
-        let m = &moves[idx];
-
-        board.apply_move(m);
-        if is_in_check(board) {
-            board.undo_move();
+    for (move_idx, &(order_score, idx, packed)) in scored.iter().enumerate() {
+        // ── LATE MOVE PRUNING (LMP) ───────────────────────────
+        // Skip quiet moves beyond the beam at shallow depths
+        if pruning && d <= 2 && move_idx >= beam && order_score < 1_000_000
+            && alpha > -MATE_SCORE + 100
+        {
             continue;
         }
 
-        // LMR for later tactical moves
-        let reduction = if prune_hard && move_idx >= 2 && effective_depth >= 3 && !in_check {
-            (move_idx as u32).min(1)
-        } else { 0 };
-        let new_depth = effective_depth.saturating_sub(1 + reduction);
+        let m = &moves[idx];
+        board.apply_move(m);
+        if is_in_check(board) { board.undo_move(); continue; }
+        searched = true;
 
-        let score = if move_idx == 0 {
-            -alphabeta(board, new_depth, -beta, -alpha, nodes, deadline, ply + 1, prune_hard, packed)
+        // ── LATE MOVE REDUCTION (LMR) ─────────────────────────
+        // Reduce depth for late quiet moves
+        let reduction = if pruning && move_idx >= 3 && d >= 3
+            && order_score < 1_000_000 && !in_check
+        {
+            let base = (move_idx / 3).min(3) as u32;
+            let depth_factor = (d / 3).min(2);
+            base + depth_factor
+        } else { 0 };
+        let new_d = d.saturating_sub(1 + reduction);
+
+        // ── PVS / egaScout ────────────────────────────────────
+        // First move: full window search
+        // Subsequent moves: null-window search (egaScout)
+        let score;
+        if move_idx == 0 {
+            score = -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed);
+        } else if reduction > 0 {
+            // Null-window search with reduced depth
+            let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, pruning, packed);
+            if nw > alpha && nw < beta {
+                // Re-search with full depth (no reduction)
+                score = -pvs(board, d.saturating_sub(1), -beta, -alpha,
+                            nodes, deadline, ply + 1, pruning, packed);
+            } else { score = nw; }
         } else {
-            let nw = -alphabeta(board, new_depth, -alpha - 1, -alpha, nodes, deadline, ply + 1, prune_hard, packed);
-            if nw > alpha && nw < beta && reduction > 0 {
-                -alphabeta(board, effective_depth.saturating_sub(1), -beta, -alpha,
-                          nodes, deadline, ply + 1, prune_hard, packed)
-            } else { nw }
-        };
+            // Null-window search (egaScout)
+            let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, pruning, packed);
+            if nw > alpha && nw < beta {
+                // Re-search with full window
+                score = -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed);
+            } else { score = nw; }
+        }
 
         board.undo_move();
 
         if score > alpha {
             alpha = score;
-            tt_flag = 0;
-            best_local = Some(m.clone());
-            fail_low = false;
-            // Store counter move
-            if prev_move != 0 { counter_move_store(prev_move, packed); }
+            tt_flag = 0; // EXACT
+            best = Some(m.clone());
         }
         if alpha >= beta {
-            tt_flag = 1;
+            tt_flag = 1; // LOWERBOUND
+            // Store killer and history for quiet moves that cause beta cutoffs
+            if order_score < 1_000_000 {
+                killer_store(d, packed);
+                history_store(m.from_sq as usize, m.to_sq as usize, d);
+            }
+            if prev_move != 0 { counter_store(prev_move, packed); }
             break;
         }
     }
 
-    // Phase 2: If still not resolved, search quiet moves (YBWC)
-    // YBWC: If the tactical search already raised alpha, we only
-    // need one quiet move to refute it, so beam is very narrow.
-    if alpha < beta && !groups.quiet.is_empty() {
-        // If we already found a good move, young brothers wait:
-        // we only need to find ONE quiet move that refutes.
-        let quiet_beam = if fail_low { max_quiet } else { 1 };
-        
-        for (move_idx, &(_score, idx, packed)) in groups.quiet[..quiet_beam.min(groups.quiet.len())].iter().enumerate() {
-            let m = &moves[idx];
-
-            // Futility pruning for quiet moves beyond the first few
-            if move_idx >= 2 && effective_depth <= 2 && alpha > -MATE_SCORE + 100 {
-                continue;
-            }
-
-            board.apply_move(m);
-            if is_in_check(board) {
-                board.undo_move();
-                continue;
-            }
-
-            // LMR for quiet moves (more aggressive)
-            let reduction = if prune_hard && effective_depth >= 2 {
-                let base = (move_idx / 2 + 1).min(3) as u32;
-                let depth_factor = (effective_depth / 3).min(2);
-                base + depth_factor
-            } else { 0 };
-            let new_depth = effective_depth.saturating_sub(1 + reduction);
-
-            let score;
-            if move_idx == 0 && fail_low {
-                score = -alphabeta(board, new_depth, -beta, -alpha, nodes, deadline, ply + 1, prune_hard, packed);
-            } else {
-                let nw = -alphabeta(board, new_depth, -alpha - 1, -alpha, nodes, deadline, ply + 1, prune_hard, packed);
-                if nw > alpha && nw < beta && reduction > 0 {
-                    score = -alphabeta(board, effective_depth.saturating_sub(1), -beta, -alpha,
-                                      nodes, deadline, ply + 1, prune_hard, packed);
-                } else { score = nw; }
-            }
-
-            board.undo_move();
-
-            if score > alpha {
-                alpha = score;
-                tt_flag = 0;
-                best_local = Some(m.clone());
-                fail_low = false;
-                if prev_move != 0 { counter_move_store(prev_move, packed); }
-                // YBWC: we found a refutation, no need to search more quiet moves
-                // unless alpha is still not > old alpha significantly
-                if move_idx > 0 { break; }
-            }
-            if alpha >= beta {
-                tt_flag = 1;
-                killer_store(effective_depth, packed);
-                history_store(m.from_sq as usize, m.to_sq as usize, effective_depth);
-                if prev_move != 0 { counter_move_store(prev_move, packed); }
-                break;
-            }
-        }
-    }
-
-    // ── DYNAMIC TREE SPLITTING ───────────────────────────────
-    // If fail_low (no move raised alpha), widen the beam.
-    // This implements progressive widening: if the narrow beam
-    // failed, search more moves.
-    if fail_low && !groups.tactical.is_empty() {
-        let wider_beam = (beam * 2).min(groups.tactical.len());
-        for &(_score, idx, packed) in &groups.tactical[max_tactical..wider_beam] {
+    // ── DYNAMIC WIDENING ──────────────────────────────────────
+    // If no move raised alpha (fail-low), search more moves
+    if !searched || (alpha <= init_alpha && !best.is_some()) {
+        for &(_score, idx, packed) in &scored[beam..scored.len().min(beam * 2)] {
             let m = &moves[idx];
             board.apply_move(m);
-            if is_in_check(board) {
-                board.undo_move();
-                continue;
-            }
-            let new_depth = effective_depth.saturating_sub(2); // reduced since we're widening
-            let nw = -alphabeta(board, new_depth, -alpha - 1, -alpha, nodes, deadline, ply + 1, prune_hard, packed);
+            if is_in_check(board) { board.undo_move(); continue; }
+            let nw = -pvs(board, d.saturating_sub(2), -alpha - 1, -alpha,
+                         nodes, deadline, ply + 1, pruning, packed);
             if nw > alpha {
-                let score = -alphabeta(board, effective_depth.saturating_sub(1), -beta, -alpha,
-                                      nodes, deadline, ply + 1, prune_hard, packed);
-                if score > alpha {
-                    alpha = score;
-                    tt_flag = 0;
-                    best_local = Some(m.clone());
-                }
+                let score = -pvs(board, d.saturating_sub(1), -beta, -alpha,
+                                nodes, deadline, ply + 1, pruning, packed);
+                if score > alpha { alpha = score; tt_flag = 0; best = Some(m.clone()); }
             }
             board.undo_move();
             if alpha >= beta { tt_flag = 1; break; }
         }
     }
 
-    // TT store
-    if let Some(bm) = &best_local {
+    // ── TT STORE ──────────────────────────────────────────────
+    if let Some(bm) = &best {
         tt_store(hash, TTEntry {
             score: alpha,
-            depth: effective_depth as i8,
+            depth: d as i8,
             flag: if alpha <= init_alpha { 2 } else { tt_flag },
             generation: 0,
             best_move: m_pack(bm),
@@ -631,51 +553,46 @@ fn quiescence(board: &mut Board, alpha: i32, beta: i32,
 }
 
 fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
-                    nodes: &mut u64, deadline: Option<Instant>, qdepth: u32) -> i32 {
+                    nodes: &mut u64, deadline: Option<Instant>, qd: u32) -> i32 {
     *nodes += 1;
     if *nodes & 4095 == 0 {
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl { return alpha; }
-        }
+        if let Some(dl) = deadline { if Instant::now() >= dl { return alpha; } }
     }
 
     if let Some(result) = board.game_result() {
         return match result {
-            GameResult::BlackWins => if board.side_to_move == BLACK { MATE_SCORE - qdepth as i32 } else { -(MATE_SCORE - qdepth as i32) },
-            GameResult::WhiteWins => if board.side_to_move == WHITE { MATE_SCORE - qdepth as i32 } else { -(MATE_SCORE - qdepth as i32) },
+            GameResult::BlackWins => if board.side_to_move == BLACK { MATE_SCORE - qd as i32 } else { -(MATE_SCORE - qd as i32) },
+            GameResult::WhiteWins => if board.side_to_move == WHITE { MATE_SCORE - qd as i32 } else { -(MATE_SCORE - qd as i32) },
             GameResult::Draw => 0,
         };
     }
 
+    // Stand pat
     let stand_pat = evaluate(board);
     if stand_pat >= beta { return beta; }
     if stand_pat > alpha { alpha = stand_pat; }
-    if qdepth >= MAX_QDEPTH { return alpha; }
+    if qd >= MAX_QDEPTH { return alpha; }
 
+    // Generate only captures and promotions
     let moves = generate_pseudo_legal_moves(board);
-    let mut scored_qmoves: Vec<(i32, usize)> = moves.iter().enumerate()
+    let mut scored: Vec<(i32, usize)> = moves.iter().enumerate()
         .filter(|(_, m)| m.captured_piece != 0 || m.mid_piece != 0 || m.is_igui || m.promotion)
         .map(|(i, m)| {
-            let vals = init_piece_values();
-            let mut score = 0;
-            if m.captured_piece != 0 { score += vals[m.captured_piece as usize] * 10; }
-            if m.mid_piece != 0 { score += vals[m.mid_piece as usize] * 10; }
-            if m.promotion { score += 5000; }
-            (score, i)
+            let v = piece_vals();
+            let mut s = 0;
+            if m.captured_piece != 0 { s += v[m.captured_piece as usize] * 10; }
+            if m.mid_piece != 0 { s += v[m.mid_piece as usize] * 10; }
+            if m.promotion { s += 5000; }
+            (s, i)
         })
         .collect();
-    scored_qmoves.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
 
-    for &(_, i) in &scored_qmoves {
+    for &(_, i) in &scored {
         let m = &moves[i];
         board.apply_move(m);
-
-        if is_in_check(board) {
-            board.undo_move();
-            continue;
-        }
-
-        let score = -quiescence_inner(board, -beta, -alpha, nodes, deadline, qdepth + 1);
+        if is_in_check(board) { board.undo_move(); continue; }
+        let score = -quiescence_inner(board, -beta, -alpha, nodes, deadline, qd + 1);
         board.undo_move();
         if score >= beta { return beta; }
         if score > alpha { alpha = score; }
