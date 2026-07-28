@@ -151,8 +151,11 @@ pub struct Move {
     pub mid_sq: u16,           // INVALID_SQ if none
     pub mid_piece: u16,
     pub mid_color: u8,
-    // Range captures stored separately (rare)
-    pub range_caps: Option<Vec<(u16, u16, u8)>>, // (sq, piece, color)
+    // Range captures stored separately (rare).
+    // Rc so that generating many moves that share the same growing capture
+    // prefix along a ray (movegen.rs::gen_range_capture) is O(1) per move
+    // (refcount bump) instead of O(n) (deep-copying the Vec each time).
+    pub range_caps: Option<std::rc::Rc<Vec<(u16, u16, u8)>>>, // (sq, piece, color)
 }
 
 impl Move {

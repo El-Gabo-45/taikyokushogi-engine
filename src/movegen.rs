@@ -418,18 +418,24 @@ fn gen_area(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
 
 fn gen_range_capture(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
                      rt: &RayTable, moves: &mut Vec<Move>) {
+    use std::rc::Rc;
     let piece_rank = pieces::rank(pt);
 
     for &dir in &mv.range_capture {
         let ray = rt.ray_for_color(sq, dir as usize, color);
+        // Grows as captures accumulate along the ray. Wrapped in Rc once
+        // captures exist so every Move sharing this prefix just bumps a
+        // refcount (O(1)) instead of deep-copying the Vec (O(n) per move,
+        // O(n^2) over the whole ray) — this was the movegen hot spot.
         let mut captured_list: Vec<(u16, u16, u8)> = Vec::new();
+        let mut shared: Option<Rc<Vec<(u16, u16, u8)>>> = None;
 
         for &rsq in ray {
             let target = board.cells[rsq as usize];
             if target == EMPTY_CELL {
                 let mut m = Move::simple(sq as u16, rsq);
-                if !captured_list.is_empty() {
-                    m.range_caps = Some(captured_list.clone());
+                if let Some(ref rc) = shared {
+                    m.range_caps = Some(Rc::clone(rc));
                 }
                 moves.push(m);
             } else {
@@ -437,6 +443,9 @@ fn gen_range_capture(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
                 let t_rank = pieces::rank(t_pt);
                 if t_rank > piece_rank {
                     captured_list.push((rsq, t_pt, cell_color(target)));
+                    // Re-share the updated prefix once per new capture
+                    // (not once per generated move).
+                    shared = Some(Rc::new(captured_list.clone()));
                     let from_in = in_promo_zone(sq, color);
                     let to_in = in_promo_zone(rsq as usize, color);
                     let may_promo = can_promote(pt) && (
@@ -448,26 +457,26 @@ fn gen_range_capture(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
                         let mut m = Move::simple(sq as u16, rsq);
                         m.captured_piece = t_pt;
                         m.captured_color = cell_color(target);
-                        m.range_caps = Some(captured_list.clone());
+                        m.range_caps = shared.clone();
                         m.promotion = true;
                         moves.push(m);
                     } else if may_promo {
                         let mut m1 = Move::simple(sq as u16, rsq);
                         m1.captured_piece = t_pt;
                         m1.captured_color = cell_color(target);
-                        m1.range_caps = Some(captured_list.clone());
+                        m1.range_caps = shared.clone();
                         moves.push(m1);
                         let mut m2 = Move::simple(sq as u16, rsq);
                         m2.captured_piece = t_pt;
                         m2.captured_color = cell_color(target);
-                        m2.range_caps = Some(captured_list.clone());
+                        m2.range_caps = shared.clone();
                         m2.promotion = true;
                         moves.push(m2);
                     } else {
                         let mut m = Move::simple(sq as u16, rsq);
                         m.captured_piece = t_pt;
                         m.captured_color = cell_color(target);
-                        m.range_caps = Some(captured_list.clone());
+                        m.range_caps = shared.clone();
                         moves.push(m);
                     }
                 } else {

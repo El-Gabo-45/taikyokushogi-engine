@@ -183,7 +183,7 @@ fn score_move(m: &Move, tt_move: u32, killer: u32, hist: i32, cntr: i32) -> i32 
         if m.captured_piece != 0 { score += vals[m.captured_piece as usize] * 100; }
         if m.mid_piece != 0 { score += vals[m.mid_piece as usize] * 100; }
         if let Some(ref caps) = m.range_caps {
-            for &(_, pt, _) in caps { score += vals[pt as usize] * 100; }
+            for &(_, pt, _) in caps.iter() { score += vals[pt as usize] * 100; }
         }
         if m.promotion { score += 5000; }
         return score;
@@ -238,7 +238,7 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
             if m.captured_piece != 0 { delta += sign * v[m.captured_piece as usize]; }
             if m.mid_piece != 0 { delta += sign * v[m.mid_piece as usize]; }
             if let Some(ref caps) = m.range_caps {
-                for &(_, pt, _) in caps { delta += sign * v[pt as usize]; }
+                for &(_, pt, _) in caps.iter() { delta += sign * v[pt as usize]; }
             }
             let s = -(base_mat + delta);
             if s > best_score { best_score = s; best_move = Some(m.clone()); }

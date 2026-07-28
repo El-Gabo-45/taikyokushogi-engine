@@ -173,7 +173,7 @@ impl Board {
         // Handle range captures
         if let Some(ref caps) = m.range_caps {
             let mut saved = Vec::new();
-            for &(sq, _cap_pt, _cap_color) in caps {
+            for &(sq, _cap_pt, _cap_color) in caps.iter() {
                 let cap_cell = self.cells[sq as usize];
                 saved.push((sq, cap_cell));
                 if cap_cell != EMPTY_CELL {
