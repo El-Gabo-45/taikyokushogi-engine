@@ -451,6 +451,17 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     let mut searched = false;
 
     for (move_idx, &(order_score, idx, packed)) in scored.iter().enumerate() {
+        // Re-check the clock between sibling moves at this node. Without
+        // this, a parent node only learns the deadline passed when a
+        // recursive pvs() call returns early -- but it would then keep
+        // trying further sibling moves anyway, so the overshoot compounds
+        // at every level of the tree. This was causing multi-second
+        // overshoots past time_limit_ms even though the leaf-level check
+        // (nodes & 255) was firing correctly.
+        if move_idx > 0 {
+            if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
+        }
+
         // ── LATE MOVE PRUNING (LMP) ───────────────────────────
         // Skip quiet moves beyond the beam at shallow depths
         if pruning && d <= 2 && move_idx >= beam && order_score < 1_000_000

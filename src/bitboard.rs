@@ -218,6 +218,21 @@ impl Bitboard1296 {
         None
     }
 
+    /// Get the last (highest-index) set square as usize, or None if empty.
+    /// Used together with first_usize to find the "first blocker" along a
+    /// ray depending on whether the ray's square indices increase or
+    /// decrease in the direction of travel (see is_in_check_bitboard).
+    #[inline(always)]
+    pub fn last_usize(&self) -> Option<usize> {
+        for (word_idx, &word) in self.words.iter().enumerate().rev() {
+            if word != 0 {
+                let bit = 63 - word.leading_zeros();
+                return Some((word_idx << 6) | bit as usize);
+            }
+        }
+        None
+    }
+
     /// Remove and return the first set square.
     #[inline(always)]
     pub fn pop_first(&mut self) -> Option<u16> {

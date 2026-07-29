@@ -59,8 +59,23 @@ fn filter_legal_moves(board: &Board, mut moves: Vec<Move>) -> Vec<Move> {
     legal_moves
 }
 
-/// Fast check detection using bitboard occupancy.
+/// Public check-detection entry point. Currently delegates to the scalar
+/// (piece-list + ray-table) implementation below, which is the verified
+/// ground truth. A bitboard-accelerated version was scaffolded in
+/// bitboard.rs (Bitboard1296 primitives) as part of the NNUE/perf work,
+/// but is_in_check_bitboard itself was never finished/validated -- wiring
+/// it in here is future work, not part of this fix.
 pub fn is_in_check(board: &Board) -> bool {
+    is_in_check_scalar(board)
+}
+
+/// Reference (scalar) check detection. Iterates opposing pieces and, for
+/// each, walks rays/deltas using precomputed RayTable lookups. This is the
+/// original, verified-correct implementation — kept as the ground truth
+/// that the bitboard-accelerated version (is_in_check_bitboard) is tested
+/// against, and as an automatic fallback if bitboard occupancy is ever
+/// found to be out of sync with `cells`.
+fn is_in_check_scalar(board: &Board) -> bool {
     let king_sq = board.king_square(board.side_to_move);
     if king_sq == INVALID_SQ { return false; }
     let king_sq_usize = king_sq as usize;
