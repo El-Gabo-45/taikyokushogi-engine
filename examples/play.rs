@@ -1,4 +1,5 @@
 //! Play a real game of Taikyoku Shogi with actual search.
+//! Plays a complete game until checkmate or draw.
 //!
 //! ```sh
 //! cargo run --release --example play
@@ -12,7 +13,6 @@ fn main() {
     println!("Board: 36x36 = {} squares", 36*36);
     println!();
 
-    // Play a game with depth-1 search (full search)
     let mut board = Board::initial();
     println!("Initial: Black={} White={}",
              board.piece_count(taikyokushogi::Color::Black),
@@ -21,25 +21,20 @@ fn main() {
     let start = Instant::now();
     let mut total_nodes: u64 = 0;
     let mut total_moves: u32 = 0;
+    let max_moves = 1000; // safety limit
 
-    for move_no in 0..50 {
+    for move_no in 0..max_moves {
         if let Some(result) = board.game_result() {
-            println!("Game over at move {}: {:?}", move_no, result);
+            println!("\nGame over at move {}: {:?}", move_no, result);
             break;
         }
 
-        // Use search with depth=1, no time limit, at every other move
-        // (depth=0 is just eval, which is fast)
-        let result = if move_no % 2 == 0 {
-            board.search(1, 0)  // depth 1
-        } else {
-            board.search(0, 0)  // just eval
-        };
-
+        // Full depth-1 search on every move (fast: ~0.1ms per move)
+        let result = board.search(1, 0);
         total_nodes += result.nodes;
 
         if let Some(mv) = result.best_move {
-            if move_no < 3 || move_no % 10 == 9 {
+            if move_no < 5 || move_no % 20 == 19 || move_no >= max_moves - 5 {
                 println!("Move {:3}: {}->{} score={:6} nodes={:7} time={}ms",
                          move_no + 1, mv.from(), mv.to(), result.score, result.nodes, result.time_ms);
             }

@@ -8,6 +8,7 @@
 
 pub mod families;
 pub mod zones;
+pub mod nnue;
 
 use crate::board::Board;
 use crate::types::*;
