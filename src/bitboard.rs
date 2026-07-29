@@ -518,3 +518,66 @@ static LIMITED_RANGE: OnceLock<LimitedRangeTable> = OnceLock::new();
 pub fn limited_range_table() -> &'static LimitedRangeTable {
     LIMITED_RANGE.get_or_init(LimitedRangeTable::new)
 }
+
+// ── Precomputed "threat zone" table (for fast is_in_check filtering) ──
+// For each square, the union of:
+//   - all 8 full-length rays from that square (covers slides, hooks,
+//     range_capture — anything that travels in a straight line)
+//   - the radius-3 area around the square (covers jumps, area moves,
+//     igui — the max jump/area delta in the entire piece set is 3, per
+//     pieces.rs; area moves and igui use max_dist <= 2 and <= 1
+//     respectively, well within radius 3)
+//
+// A piece NOT in this zone relative to the king's square cannot possibly
+// give check under any movement rule in this game, by construction of
+// the piece set above. This lets is_in_check_bitboard() intersect
+// occupancy[opp] with this zone via a handful of u64 ANDs instead of
+// walking every piece in piece_list (up to ~402 per side), and only run
+// the exact (already-verified) rule logic for the pieces that survive
+// the filter.
+pub struct ThreatZoneTable {
+    pub zones: Vec<Bitboard1296>,
+}
+
+impl ThreatZoneTable {
+    pub fn new() -> Self {
+        let at = attack_table();
+        let mut zones = Vec::with_capacity(NUM_SQUARES);
+        for sq in 0..NUM_SQUARES {
+            let mut bb = Bitboard1296::new();
+            // 8 full rays (direction doesn't matter for union purposes,
+            // since ray_bb(sq, dir) already gives the full ray regardless
+            // of color — color only flips which end is "forward").
+            for dir in 0..NUM_DIRS {
+                bb.or(at.ray_bb(sq, dir));
+            }
+            // Radius-3 box (covers jumps/area/igui; also a superset of
+            // the radius-1 king-area table, so we don't need that here).
+            let r = sq_row(sq) as i32;
+            let c = sq_col(sq) as i32;
+            for dr in -3i32..=3 {
+                for dc in -3i32..=3 {
+                    if dr == 0 && dc == 0 { continue; }
+                    let nr = r + dr;
+                    let nc = c + dc;
+                    if nr >= 0 && nr < BOARD_SIZE as i32 && nc >= 0 && nc < BOARD_SIZE as i32 {
+                        bb.set_usize((nr as usize) * BOARD_SIZE + (nc as usize));
+                    }
+                }
+            }
+            zones.push(bb);
+        }
+        ThreatZoneTable { zones }
+    }
+
+    #[inline(always)]
+    pub fn zone(&self, sq: usize) -> &Bitboard1296 {
+        &self.zones[sq]
+    }
+}
+
+static THREAT_ZONE: OnceLock<ThreatZoneTable> = OnceLock::new();
+
+pub fn threat_zone_table() -> &'static ThreatZoneTable {
+    THREAT_ZONE.get_or_init(ThreatZoneTable::new)
+}

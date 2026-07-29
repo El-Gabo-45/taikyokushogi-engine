@@ -59,14 +59,55 @@ fn filter_legal_moves(board: &Board, mut moves: Vec<Move>) -> Vec<Move> {
     legal_moves
 }
 
-/// Public check-detection entry point. Currently delegates to the scalar
-/// (piece-list + ray-table) implementation below, which is the verified
-/// ground truth. A bitboard-accelerated version was scaffolded in
-/// bitboard.rs (Bitboard1296 primitives) as part of the NNUE/perf work,
-/// but is_in_check_bitboard itself was never finished/validated -- wiring
-/// it in here is future work, not part of this fix.
+/// Public check-detection entry point. Uses the bitboard-filtered version,
+/// which only walks opposing pieces that are geometrically capable of
+/// threatening the king (per ThreatZoneTable) instead of every piece in
+/// piece_list. Falls back to the scalar full-scan automatically whenever
+/// debug_assertions are on, to catch any future desync between
+/// board.occupancy and board.cells immediately rather than silently
+/// missing a check.
 pub fn is_in_check(board: &Board) -> bool {
-    is_in_check_scalar(board)
+    let result = is_in_check_bitboard(board);
+    #[cfg(debug_assertions)]
+    {
+        let reference = is_in_check_scalar(board);
+        debug_assert_eq!(
+            result, reference,
+            "is_in_check_bitboard disagreed with is_in_check_scalar -- bitboard occupancy is out of sync with cells"
+        );
+    }
+    result
+}
+
+/// Bitboard-accelerated check detection. Intersects the opponent's
+/// occupancy bitboard with a precomputed "threat zone" for the king's
+/// square (see ThreatZoneTable in bitboard.rs) to get the small set of
+/// opposing pieces that could *possibly* threaten the king under any
+/// movement rule in this game, then runs the exact same rule logic as
+/// is_in_check_scalar (via piece_gives_check) only on that filtered set.
+/// This turns an O(pieces_per_side) scan (up to ~402) into a scan over
+/// however many opposing pieces are actually near the king -- typically
+/// far fewer, especially in the opening/midgame.
+fn is_in_check_bitboard(board: &Board) -> bool {
+    let king_sq = board.king_square(board.side_to_move);
+    if king_sq == INVALID_SQ { return false; }
+    let king_sq_usize = king_sq as usize;
+    let opp = 1 - board.side_to_move;
+    let rt = crate::types::ray_table();
+    let king_row = king_sq_usize / BOARD_SIZE;
+    let king_col = king_sq_usize % BOARD_SIZE;
+
+    let zone = crate::bitboard::threat_zone_table().zone(king_sq_usize);
+    let candidates = board.occupancy[opp as usize].and_new(zone);
+
+    let mut found = false;
+    candidates.iter_usize(|sq| {
+        if found { return; }
+        if piece_gives_check(board, sq, opp, rt, king_sq_usize, king_row, king_col) {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Reference (scalar) check detection. Iterates opposing pieces and, for
@@ -87,8 +128,25 @@ fn is_in_check_scalar(board: &Board) -> bool {
     for i in 0..board.piece_list_len[opp as usize] {
         let sq = board.piece_list[opp as usize][i] as usize;
         if sq >= NUM_SQUARES { continue; }
+        if piece_gives_check(board, sq, opp, rt, king_sq_usize, king_row, king_col) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks whether the opposing piece at `sq` gives check to the king at
+/// `king_sq_usize`. Shared by both is_in_check_scalar (called for every
+/// piece in piece_list) and is_in_check_bitboard (called only for pieces
+/// surviving the ThreatZoneTable filter) so the two implementations can
+/// never drift apart in rule logic -- only in which squares they check.
+#[inline]
+fn piece_gives_check(
+    board: &Board, sq: usize, opp: u8, rt: &RayTable,
+    king_sq_usize: usize, king_row: usize, king_col: usize,
+) -> bool {
         let cell = board.cells[sq];
-        if cell == EMPTY_CELL { continue; }
+        if cell == EMPTY_CELL { return false; }
         
         let pt = cell_piece(cell);
         let mv = pieces::movement(pt);
@@ -227,8 +285,8 @@ fn is_in_check_scalar(board: &Board) -> bool {
                 }
             }
         }
-    }
-    false
+
+        false
 }
 
 #[inline]
