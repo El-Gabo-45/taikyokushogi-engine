@@ -336,7 +336,13 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     *nodes += 1;
 
     // Time check
-    if *nodes & 8191 == 0 {
+    // NOTE: Taikyoku Shogi nodes are ~150-200us each (1296-square board,
+    // 402 pieces/side -> movegen + is_in_check are far costlier than in a
+    // normal chess engine). The old 8191-node interval meant up to ~1.2-1.6s
+    // could pass between deadline checks, badly overshooting time_limit_ms.
+    // 255 keeps the check itself cheap (bitwise AND) while checking the
+    // clock roughly every 40-50ms of real time at this engine's node cost.
+    if *nodes & 255 == 0 {
         if let Some(dl) = deadline { if Instant::now() >= dl { return alpha; } }
     }
 
@@ -453,6 +459,16 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             continue;
         }
 
+        // Re-check deadline between sibling moves, not just on function entry.
+        // Without this, a child pvs() call can return early on deadline but
+        // this loop would keep launching more siblings (each re-entering pvs,
+        // incrementing nodes, but not necessarily hitting the next 256-node
+        // boundary soon) — the overshoot compounds across ply levels.
+        // Skip on move_idx==0 since we must search at least one move.
+        if move_idx > 0 {
+            if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
+        }
+
         let m = &moves[idx];
         board.apply_move(m);
         if is_in_check(board) { board.undo_move(); continue; }
@@ -515,6 +531,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // If no move raised alpha (fail-low), search more moves
     if !searched || (alpha <= init_alpha && !best.is_some()) {
         for &(_score, idx, packed) in &scored[beam..scored.len().min(beam * 2)] {
+            if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
             let m = &moves[idx];
             board.apply_move(m);
             if is_in_check(board) { board.undo_move(); continue; }
@@ -555,7 +572,9 @@ fn quiescence(board: &mut Board, alpha: i32, beta: i32,
 fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
                     nodes: &mut u64, deadline: Option<Instant>, qd: u32) -> i32 {
     *nodes += 1;
-    if *nodes & 4095 == 0 {
+    // Same reasoning as pvs(): nodes here are expensive (movegen ~120-180us),
+    // so check the clock much more often than a typical chess engine would.
+    if *nodes & 127 == 0 {
         if let Some(dl) = deadline { if Instant::now() >= dl { return alpha; } }
     }
 
@@ -588,7 +607,10 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
 
-    for &(_, i) in &scored {
+    for (i_idx, &(_, i)) in scored.iter().enumerate() {
+        if i_idx > 0 {
+            if let Some(dl) = deadline { if Instant::now() >= dl { return alpha; } }
+        }
         let m = &moves[i];
         board.apply_move(m);
         if is_in_check(board) { board.undo_move(); continue; }

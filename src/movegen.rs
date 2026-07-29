@@ -47,7 +47,7 @@ pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
 fn filter_legal_moves(board: &Board, mut moves: Vec<Move>) -> Vec<Move> {
     let mut legal_moves = Vec::with_capacity(moves.len());
     let mut board_copy = board.clone();
-    
+
     for m in moves.drain(..) {
         board_copy.apply_move(&m);
         if !is_in_check(&board_copy) {
@@ -55,7 +55,7 @@ fn filter_legal_moves(board: &Board, mut moves: Vec<Move>) -> Vec<Move> {
         }
         board_copy.undo_move();
     }
-    
+
     legal_moves
 }
 
