@@ -14,7 +14,14 @@ use crate::bitboard::Bitboard1296;
 use std::sync::OnceLock;
 
 // ── Constants ───────────────────────────────────────────────────
-pub const NUM_PIECE_TYPES: usize = 209;
+// NUM_PIECE_TYPES must match `taikyokushogi::num_piece_types()` (i.e.
+// `pieces::PIECE_DEFS.len()`) exactly -- verified at 301 for the current
+// piece set (checked via a small runtime probe against this crate, not
+// assumed from the original design document, which had said 209 before
+// the full Taikyoku Shogi piece set was implemented). If pieces.rs ever
+// adds/removes piece types, this constant and any already-trained NNUE
+// weights must be regenerated together.
+pub const NUM_PIECE_TYPES: usize = 301;
 pub const NUM_SQUARES: usize = 1296;
 pub const NUM_COLORS: usize = 2;
 pub const FT_FEATURES: usize = NUM_SQUARES * NUM_PIECE_TYPES * NUM_COLORS; // 541,632

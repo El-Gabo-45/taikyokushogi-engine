@@ -44,7 +44,19 @@ fn should_stop_game(move_count: u32, max_moves: u32, terminal: Option<GameResult
     max_moves > 0 && move_count >= max_moves
 }
 
+/// A single training sample: board position + move played + game outcome.
+///
+/// IMPORTANT: `#[repr(C)]` is required here. This struct is serialized to
+/// disk as raw bytes (see `writer_loop` below, which does an `unsafe`
+/// byte-for-byte memory dump). Without `repr(C)`, Rust is free to reorder
+/// fields however it likes to minimize padding, and that order is not
+/// guaranteed to stay the same across compiler versions or even separate
+/// builds. That would make any external reader (e.g. the Python training
+/// script) unable to reliably parse the file format. `repr(C)` fixes the
+/// field order to exactly the declaration order below, matching a plain C
+/// struct, so this layout can be documented once and relied on forever.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct TrainingSample {
     pub board: [u16; 1296],
     pub side_to_move: u8,
@@ -174,7 +186,14 @@ impl SelfPlayWorker {
             for sq in 0..1296 {
                 let cell = board.cells[sq];
                 if cell != EMPTY_CELL {
-                    sample.board[sq] = cell_piece(cell) | ((cell_color(cell) as u16) << 8);
+                    // NOTE: piece_type can be up to 301 (9 bits), so it must
+                    // NOT be OR'd directly with (color << 8) -- that would
+                    // clobber bit 8 of piece_type for any piece_type >= 256
+                    // (there are ~45 such piece types in the full Taikyoku
+                    // Shogi piece set). Color now goes in bit 9 instead, and
+                    // piece_type is masked to 9 bits defensively even though
+                    // it should never exceed that range.
+                    sample.board[sq] = (cell_piece(cell) & 0x1FF) | ((cell_color(cell) as u16) << 9);
                 }
             }
             // Use pseudo-legal moves for policy target (much faster than generate_legal_moves)
