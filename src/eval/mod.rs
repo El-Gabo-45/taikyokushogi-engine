@@ -18,6 +18,26 @@ use crate::eval::zones::zone_score;
 
 pub const MATE_SCORE: i32 = 1_000_000;
 
+// ── Evaluation backend selection ────────────────────────────────
+// Lets callers (e.g. a match runner comparing hand-crafted eval vs NNUE
+// strength) switch backends at runtime without recompiling. Defaults to
+// the hand-crafted evaluator, so existing behavior is unchanged unless
+// something explicitly opts into NNUE.
+use std::sync::atomic::{AtomicBool, Ordering};
+static USE_NNUE: AtomicBool = AtomicBool::new(false);
+
+/// Switch the global evaluation backend. When `true`, `evaluate()` uses
+/// the NNUE network (see nnue::nnue_evaluate_from_scratch); when `false`
+/// (the default), it uses the original hand-crafted material/zone/king-
+/// safety evaluation below.
+pub fn set_use_nnue(enabled: bool) {
+    USE_NNUE.store(enabled, Ordering::Relaxed);
+}
+
+pub fn using_nnue() -> bool {
+    USE_NNUE.load(Ordering::Relaxed)
+}
+
 /// Material score from Black's perspective (legacy API).
 /// Positive = Black has more material.
 pub fn material_score(board: &Board) -> i32 {
@@ -38,13 +58,19 @@ pub fn material_score(board: &Board) -> i32 {
 
 /// Evaluate the position from the side to move's perspective.
 pub fn evaluate(board: &Board) -> i32 {
-    // Terminal positions.
+    // Terminal positions -- shared between both evaluation backends,
+    // since checkmate/draw detection doesn't depend on which evaluator
+    // is scoring non-terminal positions.
     if let Some(result) = board.game_result() {
         return match result {
             GameResult::BlackWins => if board.side_to_move == BLACK { MATE_SCORE } else { -MATE_SCORE },
             GameResult::WhiteWins => if board.side_to_move == WHITE { MATE_SCORE } else { -MATE_SCORE },
             GameResult::Draw => 0,
         };
+    }
+
+    if USE_NNUE.load(Ordering::Relaxed) {
+        return nnue::nnue_evaluate_from_scratch(board);
     }
 
     // Material + family weight.

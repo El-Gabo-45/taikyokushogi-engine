@@ -295,6 +295,32 @@ pub fn num_piece_types() -> usize {
     pieces::num_piece_types()
 }
 
+/// Switch the evaluation backend between the hand-crafted evaluator
+/// (default) and the NNUE network. See eval::set_use_nnue for details.
+/// The NNUE network is loaded from the path in the TAIKYOKU_NNUE_PATH
+/// environment variable (see eval::nnue::nnue()) the first time it's
+/// used; set that env var before calling this with `true`.
+pub fn set_use_nnue(enabled: bool) {
+    eval::set_use_nnue(enabled);
+}
+
+/// Whether the NNUE evaluation backend is currently active.
+pub fn using_nnue() -> bool {
+    eval::using_nnue()
+}
+
+/// Whether the given piece_type ID is a royal piece (King, Crown Prince,
+/// or any other piece type whose capture ends the game). Exposed
+/// specifically so external tooling (the NNUE training pipeline in
+/// training/) can determine which squares count as "the king" for
+/// HalfKP-style feature indexing without needing access to a live
+/// Board's internal royal_list -- the training data format
+/// (TrainingSample in selfplay.rs) only stores piece_type per square, not
+/// royal-list membership directly.
+pub fn is_royal_piece_type(piece_type: u16) -> bool {
+    pieces::is_royal(piece_type)
+}
+
 // ============================================================
 // Board — the main game interface
 // ============================================================
