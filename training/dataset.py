@@ -167,6 +167,77 @@ def iter_samples_from_file(path: Path):
         )
 
 
+class TrainingDataset:
+    """A simple in-memory-index dataset: indexes (file, offset) pairs for
+    every sample across all samples_*.bin files without loading all sample
+    contents into RAM up front, then reads+unpacks a single sample's bytes
+    on demand in __getitem__. This keeps RAM usage bounded even for
+    datasets with many millions of samples (selfplay.rs can generate a lot
+    of these), at the cost of a small amount of disk I/O per access --
+    acceptable since training reads are already randomized/shuffled by the
+    DataLoader, which does many small reads regardless of dataset
+    implementation.
+
+    Used by train.py via torch.utils.data.DataLoader(dataset, ...,
+    collate_fn=collate_samples).
+    """
+
+    def __init__(self, training_data_dir: Path, validate_first_n: int = 50):
+        self.training_data_dir = Path(training_data_dir)
+        files = sorted(self.training_data_dir.glob("samples_*.bin"))
+        if not files:
+            raise FileNotFoundError(
+                f"No samples_*.bin files found in {training_data_dir}. "
+                f"Run the `selfplay` binary first to generate training data."
+            )
+        self.index = []  # list of (file_path, byte_offset)
+        for f in files:
+            size = f.stat().st_size
+            if size % SAMPLE_SIZE != 0:
+                raise ValueError(
+                    f"{f}: file size {size} is not a multiple of "
+                    f"SAMPLE_SIZE={SAMPLE_SIZE} -- truncated/corrupt file, "
+                    f"or generated with a different (older) selfplay.rs "
+                    f"struct layout. Regenerate this file."
+                )
+            n = size // SAMPLE_SIZE
+            for i in range(n):
+                self.index.append((f, i * SAMPLE_SIZE))
+
+        # Validate a sample of entries up front so a bad byte-layout
+        # assumption fails loudly before a multi-hour training run, not
+        # silently in the middle of it.
+        checked = 0
+        for f, offset in self.index:
+            if checked >= validate_first_n:
+                break
+            sanity_check_sample(self._read_at(f, offset), strict=True)
+            checked += 1
+
+    def _read_at(self, path: Path, offset: int) -> Sample:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read(SAMPLE_SIZE)
+        unpacked = struct.unpack(SAMPLE_FORMAT, chunk)
+        board = np.array(unpacked[0:BOARD_SQUARES], dtype=np.uint16)
+        rest = unpacked[BOARD_SQUARES:]
+        (side_to_move, move_from, move_to, move_promo, result,
+         policy_target, value_target, move_number) = rest
+        return Sample(
+            board=board, side_to_move=side_to_move, move_from=move_from,
+            move_to=move_to, move_promo=move_promo, result=result,
+            policy_target=policy_target, value_target=value_target,
+            move_number=move_number,
+        )
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx: int) -> Sample:
+        f, offset = self.index[idx]
+        return self._read_at(f, offset)
+
+
 def load_dataset_dir(training_data_dir: Path, max_samples: int | None = None,
                       validate_first_n: int = 20):
     """Loads all samples_*.bin files in a directory into a list of Sample.
