@@ -696,3 +696,95 @@ pub fn parse_setup_rank(rank_str: &str) -> Vec<Option<u16>> {
         })
         .collect()
 }
+
+// ============================================================
+// Flat movement table — cache-friendly precomputed movement data
+// ============================================================
+// The original Movement struct uses Vec<(u8,u8)> for slides and jumps,
+// which are heap-allocated. Accessing mv.slides requires following a
+// pointer to heap memory, causing cache misses. With 402 pieces per
+// movegen call, that's 800+ pointer chases.
+//
+// FlatMovement stores the same data in fixed-size arrays (no heap
+// allocation), in a single contiguous 32KB block that fits in L1 cache.
+// Accessing it is a single array index — no pointer chasing.
+//
+// Reference: Chess Programming Wiki, "Data Structures" → flat arrays
+// for hot-path data. Stockfish uses similar flat arrays for piece
+// movement and attack tables.
+
+#[derive(Clone, Copy)]
+pub struct FlatMovement {
+    pub slides: [(u8, u8); 8],
+    pub n_slides: u8,
+    pub jumps: [(i8, i8); 16],
+    pub n_jumps: u8,
+    pub hook: u8,
+    pub area: u8,
+    pub range_capture: [u8; 8],
+    pub n_range_capture: u8,
+    pub igui: bool,
+}
+
+impl FlatMovement {
+    pub const fn empty() -> Self {
+        FlatMovement {
+            slides: [(0, 0); 8],
+            n_slides: 0,
+            jumps: [(0, 0); 16],
+            n_jumps: 0,
+            hook: 0,
+            area: 0,
+            range_capture: [0; 8],
+            n_range_capture: 0,
+            igui: false,
+        }
+    }
+}
+
+static FLAT_MOVEMENTS: OnceLock<[FlatMovement; 512]> = OnceLock::new();
+
+#[inline]
+pub fn flat_movement(pt: u16) -> &'static FlatMovement {
+    &FLAT_MOVEMENTS.get_or_init(|| {
+        let mut table = [FlatMovement::empty(); 512];
+        for pt in 1..=301u16 {
+            let mv = movement(pt);
+            let mut fm = FlatMovement::empty();
+            for (i, &(d, r)) in mv.slides.iter().enumerate().take(8) {
+                fm.slides[i] = (d, r);
+            }
+            fm.n_slides = mv.slides.len().min(8) as u8;
+            for (i, &(dr, dc)) in mv.jumps.iter().enumerate().take(16) {
+                fm.jumps[i] = (dr, dc);
+            }
+            fm.n_jumps = mv.jumps.len().min(16) as u8;
+            fm.hook = match mv.hook {
+                Some(HookType::Orthogonal) => 1,
+                Some(HookType::Diagonal) => 2,
+                None => 0,
+            };
+            fm.area = mv.area;
+            for (i, &d) in mv.range_capture.iter().enumerate().take(8) {
+                fm.range_capture[i] = d;
+            }
+            fm.n_range_capture = mv.range_capture.len().min(8) as u8;
+            fm.igui = mv.igui;
+            table[pt as usize] = fm;
+        }
+        table
+    })[(pt as usize).min(511)]
+}
+
+static CAN_PROMOTE_TABLE: OnceLock<[bool; 512]> = OnceLock::new();
+
+#[inline]
+pub fn can_promote_fast(pt: u16) -> bool {
+    CAN_PROMOTE_TABLE.get_or_init(|| {
+        let mut table = [false; 512];
+        for pt in 1..=301u16 {
+            table[pt as usize] = promotes_to(pt).is_some();
+        }
+        table
+    })[(pt as usize).min(511)]
+}

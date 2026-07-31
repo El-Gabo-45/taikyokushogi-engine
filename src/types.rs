@@ -11,18 +11,25 @@ pub const PROMO_ZONE_DEPTH: usize = 11;
 /// Check if a square is in the promotion zone for the given color.
 /// Black's promotion zone: rows 0..=10 (opponent's side).
 /// White's promotion zone: rows 25..=35 (opponent's side).
+///
+/// Uses precomputed `[bool; 1296]` lookup tables (1.3KB each) instead of
+/// computing `sq / BOARD_SIZE` on every call. This eliminates a division
+/// per `add_move` call — with 512+ moves per movegen, that's 1000+ divisions
+/// saved.
+///
+/// Reference: Chess Programming Wiki, "Precomputed Tables" → "Lookup Tables
+/// for boolean checks". Stockfish uses similar precomputed arrays for
+/// rank/file/zone checks.
 #[inline]
 pub fn in_promo_zone(sq: usize, color: u8) -> bool {
-    let row = sq / BOARD_SIZE;
-    if color == BLACK { row < PROMO_ZONE_DEPTH } else { row >= BOARD_SIZE - PROMO_ZONE_DEPTH }
+    in_promo_zone_table(sq, color)
 }
 
 /// Check if a square is the farthest rank for the given color.
 /// Black: row 0. White: row 35.
 #[inline]
 pub fn is_farthest_rank(sq: usize, color: u8) -> bool {
-    let row = sq / BOARD_SIZE;
-    if color == BLACK { row == 0 } else { row == BOARD_SIZE - 1 }
+    is_farthest_rank_table(sq, color)
 }
 
 // Directions (from Black's perspective: forward = decreasing row)
@@ -194,6 +201,9 @@ pub struct UndoInfo {
     pub range_caps: Option<Vec<(u16, Cell)>>,
     pub no_progress_plies: u32,
     pub hash: u64,
+    /// Incremental material score snapshot for fast undo.
+    /// Reference: Chess Programming Wiki, "Incremental Updates".
+    pub material_score: i32,
 }
 
 // ============================================================
@@ -300,4 +310,55 @@ pub fn zobrist_piece_key(pt: u16, sq: usize, color: u8) -> u64 {
 #[inline]
 pub fn zobrist_side_key() -> u64 {
     zobrist_table().side_key
+}
+
+// ============================================================
+// Precomputed promotion zone and farthest rank tables
+// ============================================================
+// Instead of computing sq / BOARD_SIZE on every in_promo_zone() and
+// is_farthest_rank() call (which involves a division even if the
+// compiler optimizes it to multiply+shift), we precompute the results
+// as [bool; 1296] arrays (1.3KB each). This turns each check into a
+// single array index — the fastest possible lookup.
+//
+// With 512+ moves per movegen call, each calling in_promo_zone 2× and
+// is_farthest_rank 1×, that's 1500+ divisions eliminated per movegen.
+//
+// Reference: Chess Programming Wiki, "Precomputed Tables" → "Lookup
+// Tables for boolean checks". Stockfish uses similar precomputed
+// arrays for rank/file/diagonal checks.
+
+static PROMO_ZONE_TABLES: OnceLock<[[bool; NUM_SQUARES]; 2]> = OnceLock::new();
+static FARTHEST_RANK_TABLES: OnceLock<[[bool; NUM_SQUARES]; 2]> = OnceLock::new();
+
+#[inline]
+fn in_promo_zone_table(sq: usize, color: u8) -> bool {
+    PROMO_ZONE_TABLES.get_or_init(|| {
+        let mut black = [false; NUM_SQUARES];
+        let mut white = [false; NUM_SQUARES];
+        for row in 0..PROMO_ZONE_DEPTH {
+            for col in 0..BOARD_SIZE {
+                black[row * BOARD_SIZE + col] = true;
+            }
+        }
+        for row in (BOARD_SIZE - PROMO_ZONE_DEPTH)..BOARD_SIZE {
+            for col in 0..BOARD_SIZE {
+                white[row * BOARD_SIZE + col] = true;
+            }
+        }
+        [black, white]
+    })[color as usize][sq]
+}
+
+#[inline]
+fn is_farthest_rank_table(sq: usize, color: u8) -> bool {
+    FARTHEST_RANK_TABLES.get_or_init(|| {
+        let mut black = [false; NUM_SQUARES];
+        let mut white = [false; NUM_SQUARES];
+        for col in 0..BOARD_SIZE {
+            black[col] = true; // row 0
+            white[(BOARD_SIZE - 1) * BOARD_SIZE + col] = true; // row 35
+        }
+        [black, white]
+    })[color as usize][sq]
 }

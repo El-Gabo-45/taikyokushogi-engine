@@ -20,6 +20,12 @@ pub struct Board {
     pub piece_index: [u16; NUM_SQUARES],
     // Incremental Zobrist hash — updated in apply_move/undo_move
     pub hash: u64,
+    // ── INCREMENTAL MATERIAL SCORE ────────────────────────────────
+    // Material score from Black's perspective, maintained incrementally
+    // in apply_move/undo_move. Positive = Black has more material.
+    // This makes material_score() O(1) instead of O(pieces).
+    // Reference: Chess Programming Wiki, "Incremental Updates".
+    pub material_score: i32,
     // Undo stack
     history: Vec<UndoInfo>,
     // ── BITBOARD OCCUPANCY ────────────────────────────────────────
@@ -42,6 +48,7 @@ impl Clone for Board {
             royal_count: self.royal_count,
             piece_index: self.piece_index,
             hash: self.hash,
+            material_score: self.material_score,
             history: self.history.clone(),
             occupancy: self.occupancy,
             all_occupancy: self.all_occupancy,
@@ -63,6 +70,7 @@ impl Board {
             royal_count: [0; 2],
             piece_index: [INVALID_SQ; NUM_SQUARES],
             hash: 0,
+            material_score: 0,
             history: Vec::new(),
             occupancy: [Bitboard1296::new(), Bitboard1296::new()],
             all_occupancy: Bitboard1296::new(),
@@ -81,6 +89,7 @@ impl Board {
         self.royal_count = [0; 2];
         self.piece_index = [INVALID_SQ; NUM_SQUARES];
         self.hash = 0;
+        self.material_score = 0;
         self.history.clear();
         self.occupancy = [Bitboard1296::new(), Bitboard1296::new()];
         self.all_occupancy = Bitboard1296::new();
@@ -124,6 +133,11 @@ impl Board {
         self.occupancy[c].set_usize(sq);
         self.all_occupancy.set_usize(sq);
 
+        // Update incremental material score
+        let val = pieces::value(pt) as i32;
+        if color == BLACK { self.material_score += val; }
+        else { self.material_score -= val; }
+
         if pieces::is_royal(pt) {
             let ri = self.royal_count[c];
             self.royal_list[c][ri] = sq as u16;
@@ -158,6 +172,7 @@ impl Board {
             range_caps: None,
             no_progress_plies: self.no_progress_plies,
             hash: self.hash,
+            material_score: self.material_score,
         };
 
         let is_capture = to_cell != EMPTY_CELL
@@ -179,6 +194,11 @@ impl Board {
                 if cap_cell != EMPTY_CELL {
                     self.hash ^= zobrist_piece_key(
                         cell_piece(cap_cell), sq as usize, cell_color(cap_cell));
+                    // Update incremental material score for captured piece
+                    let cap_val = pieces::value(cell_piece(cap_cell)) as i32;
+                    let cap_c = cell_color(cap_cell);
+                    if cap_c == BLACK { self.material_score -= cap_val; }
+                    else { self.material_score += cap_val; }
                 }
                 self.remove_from_lists(sq as usize);
                 self.cells[sq as usize] = EMPTY_CELL;
@@ -193,6 +213,11 @@ impl Board {
             if undo.mid_cell != EMPTY_CELL {
                 self.hash ^= zobrist_piece_key(
                     cell_piece(undo.mid_cell), msq, cell_color(undo.mid_cell));
+                // Update incremental material score for mid-captured piece
+                let mid_val = pieces::value(cell_piece(undo.mid_cell)) as i32;
+                let mid_c = cell_color(undo.mid_cell);
+                if mid_c == BLACK { self.material_score -= mid_val; }
+                else { self.material_score += mid_val; }
             }
             self.remove_from_lists(msq);
             self.cells[msq] = EMPTY_CELL;
@@ -203,12 +228,23 @@ impl Board {
             if to_cell != EMPTY_CELL {
                 self.hash ^= zobrist_piece_key(
                     cell_piece(to_cell), to, cell_color(to_cell));
+                // Update incremental material score for igui-captured piece
+                let cap_val = pieces::value(cell_piece(to_cell)) as i32;
+                let cap_c = cell_color(to_cell);
+                if cap_c == BLACK { self.material_score -= cap_val; }
+                else { self.material_score += cap_val; }
                 self.remove_from_lists(to);
                 self.cells[to] = EMPTY_CELL;
             }
             if m.promotion {
                 if let Some(promo_pt) = pieces::promotes_to(pt) {
                     self.hash ^= zobrist_piece_key(pt, from, color);
+                    // Update material score for promotion
+                    let old_val = pieces::value(pt) as i32;
+                    let new_val = pieces::value(promo_pt) as i32;
+                    let delta = new_val - old_val;
+                    if color == BLACK { self.material_score += delta; }
+                    else { self.material_score -= delta; }
                     let new_cell = make_cell(promo_pt, color);
                     self.cells[from] = new_cell;
                     self.hash ^= zobrist_piece_key(promo_pt, from, color);
@@ -237,6 +273,11 @@ impl Board {
         if to_cell != EMPTY_CELL {
             self.hash ^= zobrist_piece_key(
                 cell_piece(to_cell), to, cell_color(to_cell));
+            // Update incremental material score for captured piece
+            let cap_val = pieces::value(cell_piece(to_cell)) as i32;
+            let cap_c = cell_color(to_cell);
+            if cap_c == BLACK { self.material_score -= cap_val; }
+            else { self.material_score += cap_val; }
             self.remove_from_lists(to);
             // Bitboard cleanup for captured piece is handled in remove_from_lists
         }
@@ -246,6 +287,15 @@ impl Board {
         } else {
             pt
         };
+
+        // Update material score for promotion (if applicable)
+        if m.promotion && final_pt != pt {
+            let old_val = pieces::value(pt) as i32;
+            let new_val = pieces::value(final_pt) as i32;
+            let delta = new_val - old_val;
+            if color == BLACK { self.material_score += delta; }
+            else { self.material_score -= delta; }
+        }
 
         // Place at destination
         self.hash ^= zobrist_piece_key(final_pt, to, color);
@@ -276,6 +326,7 @@ impl Board {
         self.side_to_move = undo.side;
         self.move_number = undo.move_number;
         self.no_progress_plies = undo.no_progress_plies;
+        self.material_score = undo.material_score;
 
         let from = undo.from_sq as usize;
         let to = undo.to_sq as usize;
@@ -380,6 +431,7 @@ impl Board {
         self.royal_count = [0; 2];
         self.occupancy = [Bitboard1296::new(), Bitboard1296::new()];
         self.all_occupancy = Bitboard1296::new();
+        self.material_score = 0;
 
         for sq in 0..NUM_SQUARES {
             let cell = self.cells[sq];
@@ -394,6 +446,10 @@ impl Board {
                 self.piece_count[c] += 1;
                 self.occupancy[c].set_usize(sq);
                 self.all_occupancy.set_usize(sq);
+                // Rebuild material score
+                let val = pieces::value(pt) as i32;
+                if color == BLACK { self.material_score += val; }
+                else { self.material_score -= val; }
                 if pieces::is_royal(pt) {
                     let ri = self.royal_count[c];
                     self.royal_list[c][ri] = sq as u16;
@@ -527,6 +583,7 @@ impl Board {
             range_caps: None,
             no_progress_plies: self.no_progress_plies,
             hash: self.hash,
+            material_score: self.material_score,
         };
         self.no_progress_plies += 1;
         self.side_to_move = 1 - self.side_to_move;
@@ -541,6 +598,7 @@ impl Board {
             self.side_to_move = undo.side;
             self.move_number = undo.move_number;
             self.no_progress_plies = undo.no_progress_plies;
+            self.material_score = undo.material_score;
         }
     }
 }

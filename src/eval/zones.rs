@@ -3,6 +3,11 @@
 //! The 36×36 board is divided into four concentric zones from each player's
 //! perspective.  Pieces gain bonuses for advancing into enemy territory and
 //! penalties for retreating into their own camp.
+//!
+//! # Performance
+//!
+//! Uses `classify_fast` (precomputed O(1) table lookup) instead of the
+//! full `classify` function with branching logic.
 
 use crate::board::Board;
 use crate::types::*;
@@ -65,6 +70,8 @@ pub fn zone_family_bonus(zone: Zone, family: crate::eval::families::Family) -> i
 }
 
 /// Compute the total zone bonus for a side.
+///
+/// Uses `classify_fast` (precomputed table) for O(1) family lookup per piece.
 pub fn zone_score(board: &Board, color: u8) -> i32 {
     let c = color as usize;
     let mut score = 0;
@@ -76,7 +83,7 @@ pub fn zone_score(board: &Board, color: u8) -> i32 {
         let piece = cell_piece(cell);
         let rank = (sq / BOARD_SIZE) as u8;
         let zone = Zone::from_rank(rank, color);
-        let fam = crate::eval::families::classify(piece);
+        let fam = crate::eval::families::classify_fast(piece);
         score += zone_family_bonus(zone, fam);
     }
     score

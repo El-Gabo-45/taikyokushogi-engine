@@ -6,10 +6,23 @@
 //!
 //! Adding a new piece only requires updating its movement definition; the
 //! classification is derived automatically from the movement primitives.
+//!
+//! # Performance: Precomputed Lookup Tables
+//!
+//! `classify()` and `family_value()` involve branching logic and string
+//! checks (`abbrev.starts_with('+')`) that run for every piece on every
+//! `evaluate()` call. With 804 pieces, that's 804× per eval. We precompute
+//! the results for all 512 piece types once at startup into static arrays,
+//! then use a simple array index — turning O(branches) into O(1) per piece.
+//!
+//! Reference: "Precomputed tables" is a standard technique in chess engines
+//! (Chess Programming Wiki: "Evaluation Functions"). Stockfish uses similar
+//! precomputed PSQT (Piece-Square Tables) arrays initialized at startup.
 
 use crate::pieces;
 use crate::types::*;
 use crate::types::{N, S, E, W, NE, SE, SW, NW};
+use std::sync::OnceLock;
 
 /// Symbolic family of a piece type.  Pieces can belong to multiple families
 /// (e.g. a Lion is both a `Lion` and a `Promoted` family).  The classifier
@@ -85,6 +98,9 @@ pub const FAMILY_WEIGHT: &[i32] = &[
 ];
 
 /// Compute the family of a piece type.
+///
+/// This is the original classification logic. For hot paths (evaluate),
+/// use [`classify_fast`] which does an O(1) table lookup instead.
 pub fn classify(piece_type: u16) -> Family {
     if piece_type == 0 {
         return Family::Other;
@@ -113,7 +129,7 @@ pub fn classify(piece_type: u16) -> Family {
     }
 
     // Eagles: queen + significant jump capability.
-    let queen = m.slides.iter().all(|&(d, r)| r == 0) && m.slides.len() == 8;
+    let queen = m.slides.iter().all(|&(_d, r)| r == 0) && m.slides.len() == 8;
     if queen && m.jumps.len() >= 1 {
         return Family::Eagle;
     }
@@ -162,6 +178,9 @@ pub fn classify(piece_type: u16) -> Family {
 pub const PROMOTION_MULT: i32 = 2;
 
 /// Compute the value contribution of a single piece.
+///
+/// This is the original computation. For hot paths (evaluate), use
+/// [`family_value_fast`] which does an O(1) table lookup instead.
 pub fn family_value(piece_type: u16) -> i32 {
     let fam = classify(piece_type);
     let weight = FAMILY_WEIGHT[fam as usize];
@@ -180,4 +199,47 @@ pub fn family_value(piece_type: u16) -> i32 {
 
     // Blend the per-piece value and the family weight (50/50).
     (base * promo_mult + weight * 50) / 2
+}
+
+// ── Precomputed lookup tables ──────────────────────────────────
+
+static FAMILY_TABLE: OnceLock<[Family; 512]> = OnceLock::new();
+static FAMILY_VALUE_TABLE: OnceLock<[i32; 512]> = OnceLock::new();
+
+fn family_table() -> &'static [Family; 512] {
+    FAMILY_TABLE.get_or_init(|| {
+        let mut table = [Family::Other; 512];
+        for pt in 0..512u16 {
+            table[pt as usize] = classify(pt);
+        }
+        table
+    })
+}
+
+fn family_value_table() -> &'static [i32; 512] {
+    FAMILY_VALUE_TABLE.get_or_init(|| {
+        let mut table = [0i32; 512];
+        for pt in 0..512u16 {
+            table[pt as usize] = family_value(pt);
+        }
+        table
+    })
+}
+
+/// Fast classify via precomputed table — O(1) lookup.
+///
+/// Use this in hot paths like `evaluate()` instead of `classify()`.
+/// The table is built once on first call (lazy init via `OnceLock`).
+#[inline]
+pub fn classify_fast(piece_type: u16) -> Family {
+    family_table()[(piece_type as usize).min(511)]
+}
+
+/// Fast family_value via precomputed table — O(1) lookup.
+///
+/// Use this in hot paths like `evaluate()` instead of `family_value()`.
+/// The table is built once on first call (lazy init via `OnceLock`).
+#[inline]
+pub fn family_value_fast(piece_type: u16) -> i32 {
+    family_value_table()[(piece_type as usize).min(511)]
 }
