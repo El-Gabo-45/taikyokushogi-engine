@@ -5,9 +5,8 @@ use crate::movegen::generate_pseudo_legal_moves;
 use crate::movegen::is_in_check;
 use crate::eval::{evaluate, material_score, MATE_SCORE};
 use std::sync::atomic::{AtomicU64, AtomicI32, Ordering};
-use std::sync::{OnceLock, Arc};
+use std::sync::OnceLock;
 use std::time::Instant;
-use std::thread;
 
 // ── Transposition Table ─────────────────────────────────────────
 // Using a small bucketed transposition table improves hit rate on
@@ -33,22 +32,27 @@ fn tt() -> &'static Vec<AtomicU64> {
 #[inline]
 fn tt_index(hash: u64) -> usize { ((hash as usize) & (TT_SIZE - 1)) * TT_BUCKET_WIDTH * 2 }
 
+const TT_MOVE_MASK: u64 = (1 << 25) - 1;
+
 #[inline]
 fn tt_pack(entry: &TTEntry, gen: u8) -> u64 {
     let sc = entry.score.clamp(-32000, 32000) as i16 as u16;
-    let mv16 = (entry.best_move & 0xFFFF) as u16;
-    ((sc as u64) << 32) | ((entry.depth as u64 & 0x7F) << 25)
-        | ((entry.flag as u64) << 16) | ((gen as u64) << 8) | (mv16 as u64)
+    let mv = entry.best_move & (TT_MOVE_MASK as u32);
+    ((sc as u64) << 48)
+        | ((entry.depth as u64 & 0x7F) << 41)
+        | ((entry.flag as u64 & 0x03) << 39)
+        | ((gen as u64) << 31)
+        | (mv as u64)
 }
 
 #[inline]
 fn tt_unpack(packed: u64) -> TTEntry {
     TTEntry {
-        score: ((packed >> 32) & 0xFFFF) as u16 as i16 as i32,
-        depth: ((packed >> 25) & 0x7F) as i8,
-        flag: ((packed >> 16) & 0xFF) as u8,
-        generation: ((packed >> 8) & 0xFF) as u8,
-        best_move: (packed & 0xFFFF) as u32,
+        score: ((packed >> 48) & 0xFFFF) as u16 as i16 as i32,
+        depth: ((packed >> 41) & 0x7F) as i8,
+        flag: ((packed >> 39) & 0x03) as u8,
+        generation: ((packed >> 31) & 0xFF) as u8,
+        best_move: (packed & TT_MOVE_MASK) as u32,
     }
 }
 
@@ -190,7 +194,7 @@ fn is_tactical(m: &Move) -> bool {
 // Priority: 1) Hash move (TT)  2) MVV-LVA captures  3) Killers  4) History  5) Counter
 
 // ── Move ordering ───────────────────────────────────────────────
-fn score_move(m: &Move, tt_move: u32, killer: u32, hist: i32, cntr: i32) -> i32 {
+fn score_move(m: &Move, tt_move: u32, hist: i32, cntr: i32, depth: u32) -> i32 {
     let packed = m_pack(m);
     // 1) Hash move (from TT)
     if packed == tt_move { return 2_000_000; }
@@ -207,7 +211,8 @@ fn score_move(m: &Move, tt_move: u32, killer: u32, hist: i32, cntr: i32) -> i32 
         return score;
     }
     // 3) Killer moves
-    if packed == killer { return 90000; }
+    let kscore = killer_score(depth, packed);
+    if kscore > 0 { return kscore; }
     // 4) History heuristic
     // 5) Counter move heuristic
     hist + cntr
@@ -272,9 +277,10 @@ fn search_root_window(
         return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: start.elapsed().as_millis() as u64 };
     }
 
+    let root_tt_move = tt_probe(board.hash).map(|(_, mv)| mv).unwrap_or(0);
     let mut scored: Vec<(i32, usize)> = moves.iter().enumerate()
         .map(|(i, m)| {
-            let mut s = score_move(m, 0, 0, 0, 0);
+            let mut s = score_move(m, root_tt_move, 0, 0, 0);
             if root_hint == Some(m_pack(m)) { s += 3_000_000; }
             (s, i)
         })
@@ -348,6 +354,7 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
         Some(start + std::time::Duration::from_millis(time_limit_ms))
     } else { None };
 
+    TT_GEN.fetch_add(1, Ordering::Relaxed);
     piece_vals();
     let mut best_result = SearchResult { best_move: None, score: evaluate(board), nodes: 0, time_ms: 0 };
     let mut total_nodes: u64 = 0;
@@ -525,17 +532,12 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
 
     // ── MOVE ORDERING ─────────────────────────────────────────
     // Score each move: hash > MVV-LVA captures > killers > history > counter
-    let killer = {
-        let d_idx = d.min(127) as usize;
-        killers()[d_idx].load(Ordering::Relaxed) as u32
-    };
-
     let mut scored: Vec<(i32, usize, u32)> = moves.iter().enumerate()
         .map(|(i, m)| {
             let packed = m_pack(m);
             let hist = history_score(m.from_sq as usize, m.to_sq as usize);
             let cntr = counter_score(prev_move, packed);
-            let s = score_move(m, iid_move, killer, hist, cntr);
+            let s = score_move(m, iid_move, hist, cntr, d);
             (s, i, packed)
         })
         .collect();
