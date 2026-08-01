@@ -57,6 +57,34 @@ impl Clone for Board {
 }
 
 impl Board {
+    /// Cheap copy for search/movegen scratch work.
+    ///
+    /// The board state is copied exactly, but the undo history starts empty
+    /// because legality filtering and search only need to push/pop the moves
+    /// they try in the scratch board.
+    #[inline]
+    pub fn clone_without_history(&self) -> Self {
+        Board {
+            cells: self.cells,
+            side_to_move: self.side_to_move,
+            move_number: self.move_number,
+            no_progress_plies: self.no_progress_plies,
+            piece_list: self.piece_list,
+            piece_list_len: self.piece_list_len,
+            piece_count: self.piece_count,
+            royal_list: self.royal_list,
+            royal_count: self.royal_count,
+            piece_index: self.piece_index,
+            hash: self.hash,
+            material_score: self.material_score,
+            history: Vec::new(),
+            occupancy: self.occupancy,
+            all_occupancy: self.all_occupancy,
+        }
+    }
+}
+
+impl Board {
     pub fn new() -> Self {
         Board {
             cells: [EMPTY_CELL; NUM_SQUARES],

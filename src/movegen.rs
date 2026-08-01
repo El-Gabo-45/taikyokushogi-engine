@@ -2,6 +2,13 @@ use crate::types::*;
 use crate::pieces;
 use crate::board::Board;
 
+const HOOK_ORTHO_NS: [usize; 2] = [N, S];
+const HOOK_ORTHO_EW: [usize; 2] = [E, W];
+const HOOK_TURN_NE: [usize; 2] = [NW, SE];
+const HOOK_TURN_SE: [usize; 2] = [NE, SW];
+const HOOK_TURN_SW: [usize; 2] = [SE, NW];
+const HOOK_TURN_NW: [usize; 2] = [NE, SW];
+
 /// Generate pseudo-legal moves (fast, no legality filtering).
 /// Does NOT filter out moves that leave king in check.
 pub fn generate_pseudo_legal_moves(board: &Board) -> Vec<Move> {
@@ -46,7 +53,7 @@ pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
 
 fn filter_legal_moves(board: &Board, mut moves: Vec<Move>) -> Vec<Move> {
     let mut legal_moves = Vec::with_capacity(moves.len());
-    let mut board_copy = board.clone();
+    let mut board_copy = board.clone_without_history();
 
     for m in moves.drain(..) {
         board_copy.apply_move(&m);
@@ -199,20 +206,20 @@ fn piece_gives_check(
                     let mid = mid_sq as usize;
                     let target = board.cells[mid];
                     if target != EMPTY_CELL { break; }
-                    let turn_dirs = match mv.hook {
+                    let turn_dirs: &[usize] = match mv.hook {
                         Some(HookType::Orthogonal) => {
-                            if d == N || d == S { vec![E, W] } else { vec![N, S] }
+                            if d == N || d == S { &HOOK_ORTHO_EW } else { &HOOK_ORTHO_NS }
                         }
-                        Some(HookType::Diagonal) => {
-                            match d {
-                                NE => vec![NW, SE], SE => vec![NE, SW],
-                                SW => vec![SE, NW], NW => vec![NE, SW],
-                                _ => vec![],
-                            }
-                        }
-                        None => vec![],
+                        Some(HookType::Diagonal) => match d {
+                            NE => &HOOK_TURN_NE,
+                            SE => &HOOK_TURN_SE,
+                            SW => &HOOK_TURN_SW,
+                            NW => &HOOK_TURN_NW,
+                            _ => &[],
+                        },
+                        None => &[],
                     };
-                    for td in turn_dirs {
+                    for &td in turn_dirs {
                         let turn_ray = rt.ray_for_color(mid, td, opp);
                         for &tsq in turn_ray {
                             let t = board.cells[tsq as usize];
@@ -404,7 +411,7 @@ fn gen_hooks(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
 
     for &d in dirs {
         let ray = rt.ray_for_color(sq, d, color);
-        for (_j, &mid_sq) in ray.iter().enumerate() {
+        for &mid_sq in ray.iter() {
             let mid = mid_sq as usize;
             let target = board.cells[mid];
             if target != EMPTY_CELL {
@@ -413,20 +420,20 @@ fn gen_hooks(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
                 }
                 break;
             }
-            let turn_dirs = match mv.hook {
+            let turn_dirs: &[usize] = match mv.hook {
                 Some(HookType::Orthogonal) => {
-                    if d == N || d == S { vec![E, W] } else { vec![N, S] }
+                    if d == N || d == S { &HOOK_ORTHO_EW } else { &HOOK_ORTHO_NS }
                 }
-                Some(HookType::Diagonal) => {
-                    match d {
-                        NE => vec![NW, SE], SE => vec![NE, SW],
-                        SW => vec![SE, NW], NW => vec![NE, SW],
-                        _ => vec![],
-                    }
-                }
-                None => vec![],
+                Some(HookType::Diagonal) => match d {
+                    NE => &HOOK_TURN_NE,
+                    SE => &HOOK_TURN_SE,
+                    SW => &HOOK_TURN_SW,
+                    NW => &HOOK_TURN_NW,
+                    _ => &[],
+                },
+                None => &[],
             };
-            for td in turn_dirs {
+            for &td in turn_dirs {
                 let turn_ray = rt.ray_for_color(mid, td, color);
                 for &tsq in turn_ray {
                     let t = board.cells[tsq as usize];

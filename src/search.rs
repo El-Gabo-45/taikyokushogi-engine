@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU64, AtomicI32, Ordering};
 use std::sync::{OnceLock, Arc};
 use std::time::Instant;
 use std::thread;
-use std::collections::BinaryHeap;
 
 // ── Transposition Table ─────────────────────────────────────────
 const TT_SIZE: usize = 1 << 22;
@@ -196,35 +195,34 @@ fn score_move(m: &Move, tt_move: u32, killer: u32, hist: i32, cntr: i32) -> i32 
     hist + cntr
 }
 
-// ── Public Search ──────────────────────────────────────────────
-pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult {
+// ── Root search helpers ──────────────────────────────────────────
+// Aspiration-window iterative deepening around the previous iteration's
+// score reduces expensive root re-searches when the score is stable.
+fn search_root_window(
+    board: &mut Board,
+    depth: u32,
+    deadline: Option<Instant>,
+    root_hint: Option<u32>,
+    root_alpha: i32,
+    root_beta: i32,
+) -> SearchResult {
     let start = Instant::now();
-    let deadline = if time_limit_ms > 0 {
-        Some(start + std::time::Duration::from_millis(time_limit_ms))
-    } else { None };
-
     piece_vals();
-    let mut best_move = None;
-    let mut best_score = -MATE_SCORE - 1;
-    let mut nodes: u64 = 0;
 
-    let moves = generate_pseudo_legal_moves(board);
-    if moves.is_empty() {
+    if depth == 0 {
         return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
     }
 
-    // Score and sort root moves
-    let mut scored: Vec<(i32, usize)> = moves.iter().enumerate()
-        .map(|(i, m)| (score_move(m, 0, 0, 0, 0), i))
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    let max_moves = if depth <= 1 { moves.len() } else { moves.len().min(64) };
-
     if depth <= 1 {
+        let moves = generate_pseudo_legal_moves(board);
+        if moves.is_empty() {
+            return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
+        }
+        let mut best_move = None;
+        let mut best_score = -MATE_SCORE - 1;
+        let mut nodes: u64 = 0;
         let base_mat = material_score(board);
-        for rank in 0..max_moves {
-            let idx = scored[rank].1;
-            let m = &moves[idx];
+        for m in &moves {
             nodes += 1;
             let mut delta = 0i32;
             let sign = if board.side_to_move == BLACK { 1 } else { -1 };
@@ -244,84 +242,154 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
             let s = -(base_mat + delta);
             if s > best_score { best_score = s; best_move = Some(m.clone()); }
         }
-    } else {
-        // Seed TT
-        if depth > 2 {
-            let _ = pvs(board, depth - 2, -MATE_SCORE - 1, MATE_SCORE + 1,
-                        &mut nodes, deadline, 0, true, 0);
+        return SearchResult { best_move, score: best_score, nodes, time_ms: start.elapsed().as_millis() as u64 };
+    }
+
+    let mut nodes: u64 = 0;
+    let mut best_move = None;
+    let mut best_score = -MATE_SCORE - 1;
+    let moves = generate_pseudo_legal_moves(board);
+
+    if moves.is_empty() {
+        return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: start.elapsed().as_millis() as u64 };
+    }
+
+    let mut scored: Vec<(i32, usize)> = moves.iter().enumerate()
+        .map(|(i, m)| {
+            let mut s = score_move(m, 0, 0, 0, 0);
+            if root_hint == Some(m_pack(m)) { s += 3_000_000; }
+            (s, i)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let max_moves = if depth <= 1 { moves.len() } else { moves.len().min(64) };
+
+    if depth > 2 {
+        let _ = pvs(board, depth - 2, -MATE_SCORE - 1, MATE_SCORE + 1,
+                    &mut nodes, deadline, 0, true, 0);
+    }
+
+    for rank in 0..max_moves {
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl { break; }
         }
 
-        // Lazy SMP helpers
-        let num_helpers = if depth >= 4 && time_limit_ms > 100 {
-            let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-            (cpus.min(4)).saturating_sub(1)
-        } else { 0 };
+        let idx = scored[rank].1;
+        let m = &moves[idx];
 
-        let shared_nodes = if num_helpers > 0 { Some(Arc::new(AtomicU64::new(0))) } else { None };
-        let mut handles = Vec::new();
-        if let Some(sn) = &shared_nodes {
-            for _ in 0..num_helpers {
-                let mut hb = board.clone();
-                let sn = Arc::clone(sn);
-                let dl = deadline;
-                handles.push(thread::spawn(move || {
-                    let mut hn = 0u64;
-                    let _ = pvs(&mut hb, depth - 1, -MATE_SCORE - 1, MATE_SCORE + 1,
-                                &mut hn, dl, 0, true, 0);
-                    sn.fetch_add(hn, Ordering::Relaxed);
-                }));
+        board.apply_move(m);
+        if is_in_check(board) { board.undo_move(); continue; }
+        nodes += 1;
+
+        let (sa, sb) = if depth > 3 && rank == 0 && best_score > root_alpha + 100 {
+            (best_score - 50, best_score + 50)
+        } else {
+            (-MATE_SCORE - 1, -best_score.max(-MATE_SCORE - 1))
+        };
+
+        let score = if rank == 0 {
+            -pvs(board, depth - 1, sa, sb, &mut nodes, deadline, 0, true, m_pack(m))
+        } else {
+            let nw = -pvs(board, depth - 1, -sa - 1, -sa, &mut nodes, deadline, 0, true, m_pack(m));
+            if nw > sa && nw < sb {
+                -pvs(board, depth - 1, -sb, -sa, &mut nodes, deadline, 0, true, m_pack(m))
+            } else {
+                nw
             }
-        }
+        };
 
-        // Root search with aspiration windows
-        for rank in 0..max_moves {
-            let idx = scored[rank].1;
-            let m = &moves[idx];
-
-            board.apply_move(m);
-            if is_in_check(board) { board.undo_move(); continue; }
-            nodes += 1;
-
-            let (sa, sb) = if depth > 3 && rank == 0 && best_score > -MATE_SCORE + 100 {
-                (best_score - 50, best_score + 50)
-            } else {
-                (-MATE_SCORE - 1, -best_score.max(-MATE_SCORE - 1))
-            };
-
-            // PVS at root: first move full window, rest with null window
-            let score = if rank == 0 {
-                -pvs(board, depth - 1, sa, sb, &mut nodes, deadline, 0, true, m_pack(m))
-            } else {
-                // Null-window search (egaScout)
-                let nw = -pvs(board, depth - 1, -sa - 1, -sa, &mut nodes, deadline, 0, true, m_pack(m));
-                if nw > sa && nw < sb {
-                    -pvs(board, depth - 1, -sb, -sa, &mut nodes, deadline, 0, true, m_pack(m))
-                } else { nw }
-            };
-
-            // Research if aspiration failed
-            if score <= sa || score >= sb {
-                let full = -pvs(board, depth - 1, -MATE_SCORE - 1,
-                                -best_score.max(-MATE_SCORE - 1),
-                                &mut nodes, deadline, 0, true, m_pack(m));
-                if full > best_score { best_score = full; best_move = Some(m.clone()); }
-            } else if score > best_score {
-                best_score = score;
+        if score <= sa || score >= sb {
+            let full = -pvs(board, depth - 1, -MATE_SCORE - 1,
+                            -best_score.max(-MATE_SCORE - 1),
+                            &mut nodes, deadline, 0, true, m_pack(m));
+            if full > best_score {
+                best_score = full;
                 best_move = Some(m.clone());
             }
-
-            board.undo_move();
-            if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
+        } else if score > best_score {
+            best_score = score;
+            best_move = Some(m.clone());
         }
 
-        for h in handles { h.join().ok(); }
-        if let Some(sn) = shared_nodes { nodes += sn.load(Ordering::Relaxed); }
+        board.undo_move();
+        if best_score >= root_beta { break; }
+    }
+
+    SearchResult {
+        best_move,
+        score: best_score,
+        nodes,
+        time_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult {
+    let start = Instant::now();
+    let deadline = if time_limit_ms > 0 {
+        Some(start + std::time::Duration::from_millis(time_limit_ms))
+    } else { None };
+
+    piece_vals();
+    let mut best_result = SearchResult { best_move: None, score: evaluate(board), nodes: 0, time_ms: 0 };
+    let mut total_nodes: u64 = 0;
+    let mut root_hint: Option<u32> = None;
+    let mut score_guess = best_result.score;
+
+    if depth == 0 {
+        return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
+    }
+
+    for current_depth in 1..=depth {
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl { break; }
+        }
+
+        let result = if current_depth <= 1 {
+            search_root_window(board, current_depth, deadline, root_hint, -MATE_SCORE - 1, MATE_SCORE + 1)
+        } else {
+            let mut window = 64i32;
+            let mut alpha = score_guess.saturating_sub(window);
+            let mut beta = score_guess.saturating_add(window);
+            let mut local_result;
+
+            loop {
+                local_result = search_root_window(board, current_depth, deadline, root_hint, alpha, beta);
+                if let Some(dl) = deadline {
+                    if Instant::now() >= dl { break; }
+                }
+                if local_result.score <= alpha {
+                    window = (window * 2).min(4096);
+                    alpha = score_guess.saturating_sub(window);
+                    beta = score_guess.saturating_add(window);
+                    continue;
+                }
+                if local_result.score >= beta {
+                    window = (window * 2).min(4096);
+                    alpha = score_guess.saturating_sub(window);
+                    beta = score_guess.saturating_add(window);
+                    continue;
+                }
+                break;
+            }
+            local_result
+        };
+
+        if deadline.map(|dl| Instant::now() >= dl).unwrap_or(false) { break; }
+        total_nodes = total_nodes.saturating_add(result.nodes);
+        root_hint = result.best_move.as_ref().map(m_pack);
+        score_guess = result.score;
+        best_result = result;
     }
 
     let elapsed = start.elapsed().as_millis() as u64;
-    SearchResult { best_move, score: best_score, nodes, time_ms: elapsed }
+    SearchResult {
+        best_move: best_result.best_move,
+        score: best_result.score,
+        nodes: total_nodes.max(best_result.nodes),
+        time_ms: elapsed,
+    }
 }
-
 // ── PVS (Principal Variation Search) with egaScout ─────────────
 // This is the core search function implementing:
 // - PVS/egaScout: full window for first move, null window for rest
@@ -398,6 +466,17 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         let margin = 150 + 250 * d as i32;
         if static_eval - margin >= beta { return beta; }
         if static_eval + margin <= alpha { return alpha; }
+    }
+
+    // ── FUTILITY PRUNING (depth ≤ 2) ─────────────────────────
+    // Skip shallow quiet nodes when even optimistic gains cannot reach alpha.
+    if pruning && d <= 2 && !in_check && alpha > -MATE_SCORE + 100 {
+        let fut_margin = match d {
+            0 => 80,
+            1 => 160,
+            _ => 240,
+        };
+        if static_eval + fut_margin <= alpha { return alpha; }
     }
 
     // ── NULL MOVE PRUNING (depth ≥ 3) ─────────────────────────
@@ -486,6 +565,12 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         if is_in_check(board) { board.undo_move(); continue; }
         searched = true;
 
+        // ── SINGULAR EXTENSION ─────────────────────────────────
+        // If the TT move is clearly the principal move in a deep node,
+        // give it a small extension. Kept conservative to avoid exploding
+        // the tree on gigantic boards.
+        let singular_ext = pruning && d >= 6 && !in_check && tt_move != 0 && packed == tt_move && order_score < 1_000_000;
+
         // ── LATE MOVE REDUCTION (LMR) ─────────────────────────
         // Reduce depth for late quiet moves
         let reduction = if pruning && move_idx >= 3 && d >= 3
@@ -495,7 +580,8 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             let depth_factor = (d / 3).min(2);
             base + depth_factor
         } else { 0 };
-        let new_d = d.saturating_sub(1 + reduction);
+        let mut new_d = d.saturating_sub(1 + reduction);
+        if singular_ext { new_d = new_d.saturating_add(1); }
 
         // ── PVS / egaScout ────────────────────────────────────
         // First move: full window search
@@ -575,73 +661,6 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
 
 // ── Quiescence Search ──────────────────────────────────────────
 const MAX_QDEPTH: u32 = 6;
-// Qsearch acts as the leaf of the search tree, so the movegen cost per
-// node dominates. Two optimizations from the Taikyoku Shogi advice apply
-// directly here:
-//
-// 1. **Delta pruning**: if a capture's best-case value (captured piece +
-//    stand-pat) can't beat alpha, skip it entirely. Since pieces have big
-//    material values in this variant, this culls hopeless captures cheaply
-//    before the expensive apply_move + is_in_check legality check.
-//
-// 2. **k-best beam**: instead of sorting the full capture list (which
-//    allocates a Vec and does a full O(n log n) sort at every qsearch
-//    leaf), keep only the top-K captures by MVV-LVA using a small BinaryHeap.
-//    This is "k-best / beam pruning" applied to quiescence — culls late,
-//    low-value captures without ever paying for a full sort.
-
-/// Static Exchange Evaluation — conservative estimate of a capture's net
-/// material gain, used in qsearch to prune clearly losing captures.
-///
-/// Full SEE walks the attack tree on the destination square. This engine
-/// lacks a bitboard attack-map API for arbitrary piece types (that requires
-/// a movegen rewrite), so we use a material-only heuristic that is
-/// *deliberately conservative* to avoid false pruning:
-///
-/// - Lion mid-captures, igui, and range-captures are never pruned (they
-///   don't land on the captured square, so the opponent's recapture doesn't
-///   apply the normal way — this is exactly the Lion/Lion Dog caveat from
-///   the Taikyoku advice).
-/// - For a plain single-square capture, we compare the captured value to
-///   what the mover commits. The heuristic only returns ≤ 0 (i.e. prunes)
-///   when the captured piece is worth far less than a quarter of the mover
-///   — a clearly losing trade (e.g. a General taking a trapped Pawn that
-///   will be recaptured). This still leaves the k-best beam and delta
-///   pruning to handle the rest of the culling, so it's low-risk.
-fn see_capture(board: &Board, m: &Move, v: &[i32; 512]) -> i32 {
-    // Non-landing captures: their tactic can't be summarized by a single
-    // square exchange, so never prune them.
-    if m.mid_sq != INVALID_SQ || m.is_igui || m.range_caps.is_some() {
-        return 1;
-    }
-
-    let to = m.to_sq as usize;
-    if board.cells[to] == EMPTY_CELL {
-        // Non-capturing promotion: value the promotion gain.
-        if m.promotion {
-            let from = m.from_sq as usize;
-            let pt = cell_piece(board.cells[from]);
-            if let Some(p) = pieces::promotes_to(pt) {
-                return v[p as usize] - v[pt as usize];
-            }
-        }
-        return 1;
-    }
-
-    let from = m.from_sq as usize;
-    let from_cell = board.cells[from];
-    if from_cell == EMPTY_CELL { return 1; }
-
-    let moving_pt = cell_piece(from_cell);
-    let moving_val = v[moving_pt as usize];
-    let captured_val = v[m.captured_piece as usize];
-
-    // Only prune when the mover is clearly more valuable than the capture
-    // (moving_val / 4 > captured_val) — a heavily losing trade. Normalize
-    // by 4 so small-value trades (Pawn-vs-Pawn) are never pruned.
-    let net = captured_val - moving_val / 4;
-    if net <= 0 { net } else { net / 4 * 4 + 1 }
-}
 
 fn quiescence(board: &mut Board, alpha: i32, beta: i32,
               nodes: &mut u64, deadline: Option<Instant>) -> i32 {
@@ -671,110 +690,32 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
     if stand_pat > alpha { alpha = stand_pat; }
     if qd >= MAX_QDEPTH { return alpha; }
 
-    // Delta margin: how much better than stand-pat must a capture be to
-    // be worth searching? In this variant pieces have large values (a
-    // pawn is 500, a rook 5000, generals 12000-20000), so we use a
-    // generous delta. If not even the delta margin can beat alpha, the
-    // capture is hopeless.
-    let delta = 200 + 25 * qd as i32;
-
-    // Generate all pseudo-legal moves once. We could stage (attacks-only
-    // first), but the movegen here already walks rays/jumps checking
-    // occupancy and only emits captures alongside quiet moves in a single
-    // pass. To avoid a second full pass just for tactical moves, we keep
-    // the single generation and select the best tactical moves with a
-    // bounded heap below. The advices "generate captures first" is honored
-    // in spirit: we only *search* captures/promotions, never quies.
+    // Generate only captures and promotions
     let moves = generate_pseudo_legal_moves(board);
-    let v = piece_vals();
-
-    // Delta pruning + k-best beam: build the top-8 capture moves by
-    // MVV-LVA using a min-heap maintained at size 8. This is O(n log 8)
-    // instead of O(n log n) per qsearch node, and skips low-value
-    // captures entirely.
-    let mut minheap: BinaryHeap<std::cmp::Reverse<(i32, usize)>> = BinaryHeap::new();
-    for (i, m) in moves.iter().enumerate() {
-        let is_tac = m.captured_piece != 0 || m.mid_piece != 0
-            || m.is_igui || m.promotion || m.range_caps.is_some();
-        if !is_tac { continue; }
-
-        // Basic MVV-LVA score (scaled for ordering only)
-        let mut score = 0i32;
-        // Raw captured value (unscaled) — this is the upper bound on how
-        // much this capture can improve over stand-pat, so it's what
-        // delta pruning compares against alpha.
-        let mut raw_cap = 0i32;
-        if m.captured_piece != 0 {
-            let cv = v[m.captured_piece as usize];
-            score += cv * 10;
-            raw_cap += cv;
-        }
-        if m.mid_piece != 0 {
-            let cv = v[m.mid_piece as usize];
-            score += cv * 10;
-            raw_cap += cv;
-        }
-        if let Some(ref caps) = m.range_caps {
-            for &(_, pt, _) in caps.iter() {
-                let cv = v[pt as usize];
-                score += cv * 10;
-                raw_cap += cv;
-            }
-        }
-        if m.promotion { score += 5000; raw_cap += 5000; }
-        if m.is_igui { score += 2000; raw_cap += 2000; }
-
-        // Delta pruning: if even the raw captured value (the best case)
-        // can't beat alpha by the margin, skip the move. The stand-pat
-        // already raised alpha, so capturing a piece worth `raw_cap` can
-        // at most improve the score by `raw_cap` (plus the opponent's
-        // recapture risk, which delta margins conservatively account for).
-        if raw_cap + delta <= alpha {
-            continue;
-        }
-
-        if minheap.len() < 8 {
-            minheap.push(std::cmp::Reverse((score, i)));
-        } else if let Some(&std::cmp::Reverse((lowest, _))) = minheap.peek() {
-            if score > lowest {
-                minheap.pop();
-                minheap.push(std::cmp::Reverse((score, i)));
-            }
-        }
-    }
-
-    // If no captures survived delta pruning, return stand-pat (stand_pat
-    // already updated alpha). This is the "no captures → qsearch done"
-    // early-out that avoided wasting the movegen pass.
-    if minheap.is_empty() {
-        return alpha;
-    }
-
-    // Extract and sort the top-8 descending.
-    let mut best_list: Vec<(i32, usize)> = minheap.into_iter()
-        .map(|std::cmp::Reverse(p)| p)
+    let mut scored: Vec<(i32, usize)> = moves.iter().enumerate()
+        .filter(|(_, m)| m.captured_piece != 0 || m.mid_piece != 0 || m.is_igui || m.promotion)
+        .map(|(i, m)| {
+            let v = piece_vals();
+            let mut s = 0;
+            if m.captured_piece != 0 { s += v[m.captured_piece as usize] * 10; }
+            if m.mid_piece != 0 { s += v[m.mid_piece as usize] * 10; }
+            if m.promotion { s += 5000; }
+            (s, i)
+        })
         .collect();
-    best_list.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
 
-    for (i_idx, &(score, i)) in best_list.iter().enumerate() {
+    for (i_idx, &(_, i)) in scored.iter().enumerate() {
         if i_idx > 0 {
             if let Some(dl) = deadline { if Instant::now() >= dl { return alpha; } }
         }
         let m = &moves[i];
-
-        // ── LOSING CAPTURE PRUNING (SEE) ─────────────────────
-        // If SEE says the capture is clearly losing, skip it before
-        // spending apply_move + is_in_check + recursive qsearch on it.
-        if see_capture(board, m, v) <= 0 {
-            continue;
-        }
-
         board.apply_move(m);
         if is_in_check(board) { board.undo_move(); continue; }
-        let child = -quiescence_inner(board, -beta, -alpha, nodes, deadline, qd + 1);
+        let score = -quiescence_inner(board, -beta, -alpha, nodes, deadline, qd + 1);
         board.undo_move();
-        if child >= beta { return beta; }
-        if child > alpha { alpha = child; }
+        if score >= beta { return beta; }
+        if score > alpha { alpha = score; }
     }
     alpha
 }
