@@ -10,7 +10,10 @@ use std::time::Instant;
 use std::thread;
 
 // ── Transposition Table ─────────────────────────────────────────
+// Using a small bucketed transposition table improves hit rate on
+// large-board search without increasing the overall table size.
 const TT_SIZE: usize = 1 << 22;
+const TT_BUCKET_WIDTH: usize = 4;
 
 #[derive(Clone, Copy)]
 struct TTEntry {
@@ -24,11 +27,11 @@ struct TTEntry {
 static TT: OnceLock<Vec<AtomicU64>> = OnceLock::new();
 
 fn tt() -> &'static Vec<AtomicU64> {
-    TT.get_or_init(|| (0..TT_SIZE * 2).map(|_| AtomicU64::new(0)).collect())
+    TT.get_or_init(|| (0..TT_SIZE * TT_BUCKET_WIDTH * 2).map(|_| AtomicU64::new(0)).collect())
 }
 
 #[inline]
-fn tt_index(hash: u64) -> usize { (hash as usize) & (TT_SIZE - 1) }
+fn tt_index(hash: u64) -> usize { ((hash as usize) & (TT_SIZE - 1)) * TT_BUCKET_WIDTH * 2 }
 
 #[inline]
 fn tt_pack(entry: &TTEntry, gen: u8) -> u64 {
@@ -53,28 +56,43 @@ static TT_GEN: AtomicU64 = AtomicU64::new(1);
 fn tt_gen() -> u8 { (TT_GEN.load(Ordering::Relaxed) & 0xFF) as u8 }
 
 fn tt_probe(hash: u64) -> Option<(TTEntry, u32)> {
-    let idx = tt_index(hash) * 2;
+    let base = tt_index(hash);
     let t = tt();
-    let stored = t[idx].load(Ordering::Relaxed);
-    if stored == hash {
-        let entry = tt_unpack(t[idx + 1].load(Ordering::Relaxed));
-        if entry.depth >= 0 { return Some((entry, entry.best_move)); }
+    for i in 0..TT_BUCKET_WIDTH {
+        let idx = base + i * 2;
+        let stored = t[idx].load(Ordering::Relaxed);
+        if stored == hash {
+            let entry = tt_unpack(t[idx + 1].load(Ordering::Relaxed));
+            if entry.depth >= 0 { return Some((entry, entry.best_move)); }
+        }
     }
     None
 }
 
 fn tt_store(hash: u64, entry: TTEntry) {
-    let idx = tt_index(hash) * 2;
+    let base = tt_index(hash);
     let t = tt();
     let gen = tt_gen();
-    let old_hash = t[idx].load(Ordering::Relaxed);
-    let old = tt_unpack(t[idx + 1].load(Ordering::Relaxed));
-    let replace = old_hash == 0 || entry.depth > old.depth
-        || (entry.depth == old.depth && gen.wrapping_sub(old.generation) > 100);
-    if replace {
-        t[idx].store(hash, Ordering::Relaxed);
-        t[idx + 1].store(tt_pack(&entry, gen), Ordering::Relaxed);
+    let mut replace_idx = 0;
+    let mut replace_score = i32::MAX;
+
+    for i in 0..TT_BUCKET_WIDTH {
+        let idx = base + i * 2;
+        let old_hash = t[idx].load(Ordering::Relaxed);
+        if old_hash == 0 {
+            replace_idx = idx;
+            break;
+        }
+        let old = tt_unpack(t[idx + 1].load(Ordering::Relaxed));
+        let score = ((old.depth as i32) << 16) - (gen.wrapping_sub(old.generation) as i32);
+        if score < replace_score {
+            replace_score = score;
+            replace_idx = idx;
+        }
     }
+
+    t[replace_idx].store(hash, Ordering::Relaxed);
+    t[replace_idx + 1].store(tt_pack(&entry, gen), Ordering::Relaxed);
 }
 
 // ── Killers ─────────────────────────────────────────────────────
