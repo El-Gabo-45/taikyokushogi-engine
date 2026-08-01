@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicI32, Ordering};
 use std::sync::{OnceLock, Arc};
 use std::time::Instant;
 use std::thread;
+use std::collections::BinaryHeap;
 
 // ── Transposition Table ─────────────────────────────────────────
 const TT_SIZE: usize = 1 << 22;
@@ -574,6 +575,73 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
 
 // ── Quiescence Search ──────────────────────────────────────────
 const MAX_QDEPTH: u32 = 6;
+// Qsearch acts as the leaf of the search tree, so the movegen cost per
+// node dominates. Two optimizations from the Taikyoku Shogi advice apply
+// directly here:
+//
+// 1. **Delta pruning**: if a capture's best-case value (captured piece +
+//    stand-pat) can't beat alpha, skip it entirely. Since pieces have big
+//    material values in this variant, this culls hopeless captures cheaply
+//    before the expensive apply_move + is_in_check legality check.
+//
+// 2. **k-best beam**: instead of sorting the full capture list (which
+//    allocates a Vec and does a full O(n log n) sort at every qsearch
+//    leaf), keep only the top-K captures by MVV-LVA using a small BinaryHeap.
+//    This is "k-best / beam pruning" applied to quiescence — culls late,
+//    low-value captures without ever paying for a full sort.
+
+/// Static Exchange Evaluation — conservative estimate of a capture's net
+/// material gain, used in qsearch to prune clearly losing captures.
+///
+/// Full SEE walks the attack tree on the destination square. This engine
+/// lacks a bitboard attack-map API for arbitrary piece types (that requires
+/// a movegen rewrite), so we use a material-only heuristic that is
+/// *deliberately conservative* to avoid false pruning:
+///
+/// - Lion mid-captures, igui, and range-captures are never pruned (they
+///   don't land on the captured square, so the opponent's recapture doesn't
+///   apply the normal way — this is exactly the Lion/Lion Dog caveat from
+///   the Taikyoku advice).
+/// - For a plain single-square capture, we compare the captured value to
+///   what the mover commits. The heuristic only returns ≤ 0 (i.e. prunes)
+///   when the captured piece is worth far less than a quarter of the mover
+///   — a clearly losing trade (e.g. a General taking a trapped Pawn that
+///   will be recaptured). This still leaves the k-best beam and delta
+///   pruning to handle the rest of the culling, so it's low-risk.
+fn see_capture(board: &Board, m: &Move, v: &[i32; 512]) -> i32 {
+    // Non-landing captures: their tactic can't be summarized by a single
+    // square exchange, so never prune them.
+    if m.mid_sq != INVALID_SQ || m.is_igui || m.range_caps.is_some() {
+        return 1;
+    }
+
+    let to = m.to_sq as usize;
+    if board.cells[to] == EMPTY_CELL {
+        // Non-capturing promotion: value the promotion gain.
+        if m.promotion {
+            let from = m.from_sq as usize;
+            let pt = cell_piece(board.cells[from]);
+            if let Some(p) = pieces::promotes_to(pt) {
+                return v[p as usize] - v[pt as usize];
+            }
+        }
+        return 1;
+    }
+
+    let from = m.from_sq as usize;
+    let from_cell = board.cells[from];
+    if from_cell == EMPTY_CELL { return 1; }
+
+    let moving_pt = cell_piece(from_cell);
+    let moving_val = v[moving_pt as usize];
+    let captured_val = v[m.captured_piece as usize];
+
+    // Only prune when the mover is clearly more valuable than the capture
+    // (moving_val / 4 > captured_val) — a heavily losing trade. Normalize
+    // by 4 so small-value trades (Pawn-vs-Pawn) are never pruned.
+    let net = captured_val - moving_val / 4;
+    if net <= 0 { net } else { net / 4 * 4 + 1 }
+}
 
 fn quiescence(board: &mut Board, alpha: i32, beta: i32,
               nodes: &mut u64, deadline: Option<Instant>) -> i32 {
@@ -603,32 +671,110 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
     if stand_pat > alpha { alpha = stand_pat; }
     if qd >= MAX_QDEPTH { return alpha; }
 
-    // Generate only captures and promotions
-    let moves = generate_pseudo_legal_moves(board);
-    let mut scored: Vec<(i32, usize)> = moves.iter().enumerate()
-        .filter(|(_, m)| m.captured_piece != 0 || m.mid_piece != 0 || m.is_igui || m.promotion)
-        .map(|(i, m)| {
-            let v = piece_vals();
-            let mut s = 0;
-            if m.captured_piece != 0 { s += v[m.captured_piece as usize] * 10; }
-            if m.mid_piece != 0 { s += v[m.mid_piece as usize] * 10; }
-            if m.promotion { s += 5000; }
-            (s, i)
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    // Delta margin: how much better than stand-pat must a capture be to
+    // be worth searching? In this variant pieces have large values (a
+    // pawn is 500, a rook 5000, generals 12000-20000), so we use a
+    // generous delta. If not even the delta margin can beat alpha, the
+    // capture is hopeless.
+    let delta = 200 + 25 * qd as i32;
 
-    for (i_idx, &(_, i)) in scored.iter().enumerate() {
+    // Generate all pseudo-legal moves once. We could stage (attacks-only
+    // first), but the movegen here already walks rays/jumps checking
+    // occupancy and only emits captures alongside quiet moves in a single
+    // pass. To avoid a second full pass just for tactical moves, we keep
+    // the single generation and select the best tactical moves with a
+    // bounded heap below. The advices "generate captures first" is honored
+    // in spirit: we only *search* captures/promotions, never quies.
+    let moves = generate_pseudo_legal_moves(board);
+    let v = piece_vals();
+
+    // Delta pruning + k-best beam: build the top-8 capture moves by
+    // MVV-LVA using a min-heap maintained at size 8. This is O(n log 8)
+    // instead of O(n log n) per qsearch node, and skips low-value
+    // captures entirely.
+    let mut minheap: BinaryHeap<std::cmp::Reverse<(i32, usize)>> = BinaryHeap::new();
+    for (i, m) in moves.iter().enumerate() {
+        let is_tac = m.captured_piece != 0 || m.mid_piece != 0
+            || m.is_igui || m.promotion || m.range_caps.is_some();
+        if !is_tac { continue; }
+
+        // Basic MVV-LVA score (scaled for ordering only)
+        let mut score = 0i32;
+        // Raw captured value (unscaled) — this is the upper bound on how
+        // much this capture can improve over stand-pat, so it's what
+        // delta pruning compares against alpha.
+        let mut raw_cap = 0i32;
+        if m.captured_piece != 0 {
+            let cv = v[m.captured_piece as usize];
+            score += cv * 10;
+            raw_cap += cv;
+        }
+        if m.mid_piece != 0 {
+            let cv = v[m.mid_piece as usize];
+            score += cv * 10;
+            raw_cap += cv;
+        }
+        if let Some(ref caps) = m.range_caps {
+            for &(_, pt, _) in caps.iter() {
+                let cv = v[pt as usize];
+                score += cv * 10;
+                raw_cap += cv;
+            }
+        }
+        if m.promotion { score += 5000; raw_cap += 5000; }
+        if m.is_igui { score += 2000; raw_cap += 2000; }
+
+        // Delta pruning: if even the raw captured value (the best case)
+        // can't beat alpha by the margin, skip the move. The stand-pat
+        // already raised alpha, so capturing a piece worth `raw_cap` can
+        // at most improve the score by `raw_cap` (plus the opponent's
+        // recapture risk, which delta margins conservatively account for).
+        if raw_cap + delta <= alpha {
+            continue;
+        }
+
+        if minheap.len() < 8 {
+            minheap.push(std::cmp::Reverse((score, i)));
+        } else if let Some(&std::cmp::Reverse((lowest, _))) = minheap.peek() {
+            if score > lowest {
+                minheap.pop();
+                minheap.push(std::cmp::Reverse((score, i)));
+            }
+        }
+    }
+
+    // If no captures survived delta pruning, return stand-pat (stand_pat
+    // already updated alpha). This is the "no captures → qsearch done"
+    // early-out that avoided wasting the movegen pass.
+    if minheap.is_empty() {
+        return alpha;
+    }
+
+    // Extract and sort the top-8 descending.
+    let mut best_list: Vec<(i32, usize)> = minheap.into_iter()
+        .map(|std::cmp::Reverse(p)| p)
+        .collect();
+    best_list.sort_by(|a, b| b.0.cmp(&a.0));
+
+    for (i_idx, &(score, i)) in best_list.iter().enumerate() {
         if i_idx > 0 {
             if let Some(dl) = deadline { if Instant::now() >= dl { return alpha; } }
         }
         let m = &moves[i];
+
+        // ── LOSING CAPTURE PRUNING (SEE) ─────────────────────
+        // If SEE says the capture is clearly losing, skip it before
+        // spending apply_move + is_in_check + recursive qsearch on it.
+        if see_capture(board, m, v) <= 0 {
+            continue;
+        }
+
         board.apply_move(m);
         if is_in_check(board) { board.undo_move(); continue; }
-        let score = -quiescence_inner(board, -beta, -alpha, nodes, deadline, qd + 1);
+        let child = -quiescence_inner(board, -beta, -alpha, nodes, deadline, qd + 1);
         board.undo_move();
-        if score >= beta { return beta; }
-        if score > alpha { alpha = score; }
+        if child >= beta { return beta; }
+        if child > alpha { alpha = child; }
     }
     alpha
 }
