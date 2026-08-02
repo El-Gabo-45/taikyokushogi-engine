@@ -19,11 +19,11 @@ const HOOK_TURN_NW: [usize; 2] = [NE, SW];
 //
 // Format: JUMP_TABLE[pt][sq][color] -> &[(dest_sq, is_forward)]
 // We store dest_sq as u16 (INVALID_SQ if off-board).
-static JUMP_TABLE: OnceLock<[[[[u16; 8]; 2]; NUM_SQUARES]; 512]> = OnceLock::new();
+static JUMP_TABLE: OnceLock<Box<[[[[u16; 8]; 2]; NUM_SQUARES]; 512]>> = OnceLock::new();
 
 fn jump_table() -> &'static [[[[u16; 8]; 2]; NUM_SQUARES]; 512] {
     JUMP_TABLE.get_or_init(|| {
-        let mut table = [[[[INVALID_SQ; 8]; 2]; NUM_SQUARES]; 512];
+        let mut table = Box::new([[[[INVALID_SQ; 8]; 2]; NUM_SQUARES]; 512]);
         for pt in 1..=301u16 {
             let mv = pieces::movement(pt);
             if mv.jumps.is_empty() { continue; }
@@ -52,6 +52,7 @@ fn jump_table() -> &'static [[[[u16; 8]; 2]; NUM_SQUARES]; 512] {
         table
     })
 }
+
 
 /// Generate pseudo-legal moves (fast, no legality filtering).
 /// Does NOT filter out moves that leave king in check.
@@ -209,18 +210,13 @@ fn piece_gives_check(
         let dc = if psq_col > king_col { psq_col - king_col } else { king_col - psq_col };
         let max_dist = dr.max(dc);
         
-        // Jumps
-        for &(jdr, jdc) in &mv.jumps {
-            let abs_dr = jdr.unsigned_abs() as usize;
-            let abs_dc = jdc.unsigned_abs() as usize;
-            if dr == abs_dr && dc == abs_dc {
-                let r = psq_row as i32;
-                let c = psq_col as i32;
-                let (ddr, ddc) = if opp == BLACK { (jdr as i32, jdc as i32) } else { (-(jdr as i32), -(jdc as i32)) };
-                let nr = r + ddr; let nc = c + ddc;
-                if nr >= 0 && nr < BOARD_SIZE as i32 && nc >= 0 && nc < BOARD_SIZE as i32 {
-                    if (nr as usize * BOARD_SIZE + nc as usize) == king_sq_usize { return true; }
-                }
+        // Jumps — use precomputed JUMP_TABLE for O(1) destination lookup
+        // instead of per-jump arithmetic + bounds checking.
+        if !mv.jumps.is_empty() {
+            let jt = jump_table();
+            let dests = &jt[pt as usize][sq][opp as usize];
+            for j in 0..mv.jumps.len().min(8) {
+                if dests[j] as usize == king_sq_usize { return true; }
             }
         }
 

@@ -516,7 +516,11 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // Reference: HaChu (hgm.nubati.net) — incremental evaluation scales
     // with the board perimeter, not the area.
     if d <= 2 && pruning {
-        return evaluate(board);
+        // Use O(1) incremental material score instead of O(pieces) full eval.
+        // The material score is already maintained incrementally in
+        // apply_move/undo_move, so this is ~100x cheaper than evaluate().
+        let mat = material_score(board);
+        return if board.side_to_move == BLACK { mat } else { -mat };
     }
 
     // ── STATIC EVAL ───────────────────────────────────────────
