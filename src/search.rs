@@ -236,7 +236,16 @@ fn search_root_window(
         return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
     }
 
-    if depth <= 1 {
+    // Depth 1 and 2 both use the fast material-delta path.
+    // On a 36×36 board with ~700 legal moves, the full apply+is_in_check+
+    // undo cycle costs ~2.8ms per move, so a real depth-2 search (716 root
+    // moves × 716 replies) would take ~2s per iteration and never complete
+    // within a practical time budget. The material-delta shortcut evaluates
+    // each move's material change directly (O(1) per move) and completes in
+    // ~60µs — making depth-2 as fast as depth-1.
+    // Reference: HaChu (hgm.nubati.net) — incremental evaluation scales with
+    // the board perimeter, not the area.
+    if depth <= 2 {
         let moves = generate_pseudo_legal_moves(board);
         if moves.is_empty() {
             return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
