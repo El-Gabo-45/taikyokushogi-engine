@@ -236,16 +236,16 @@ fn search_root_window(
         return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
     }
 
-    // Depth 1 and 2 both use the fast material-delta path.
+    // Depth 1-3 all use the fast material-delta path.
     // On a 36×36 board with ~700 legal moves, the full apply+is_in_check+
-    // undo cycle costs ~2.8ms per move, so a real depth-2 search (716 root
-    // moves × 716 replies) would take ~2s per iteration and never complete
-    // within a practical time budget. The material-delta shortcut evaluates
-    // each move's material change directly (O(1) per move) and completes in
-    // ~60µs — making depth-2 as fast as depth-1.
+    // undo cycle costs ~2.8ms per move, so a real depth-2/3 search (716 root
+    // moves × 716 replies) would take seconds per iteration and never
+    // complete within a practical time budget. The material-delta shortcut
+    // evaluates each move's material change directly (O(1) per move) and
+    // completes in ~60-100µs — making depth-2 and depth-3 as fast as depth-1.
     // Reference: HaChu (hgm.nubati.net) — incremental evaluation scales with
-    // the board perimeter, not the area.
-    if depth <= 2 {
+    // the board perimeter, not the area. RPS reduces the branching factor.
+    if depth <= 3 {
         let moves = generate_pseudo_legal_moves(board);
         if moves.is_empty() {
             return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
@@ -297,7 +297,22 @@ fn search_root_window(
     }
     scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
-    let max_moves = if depth <= 1 { moves.len() } else { moves.len().min(64) };
+    // ── REALIZATION PROBABILITY SEARCH (RPS) ──────────────────
+    // Instead of searching all ~700 legal moves at the root, only search
+    // the top-N moves ordered by score (captures, killers, history). This
+    // is the key technique from GEKISASHI (Tsuruoka et al., 2002) that won
+    // the World Shogi Championship — it reduces the effective branching
+    // factor from ~700 to a small beam, making deeper search feasible.
+    // Reference: "Game-Tree Search Algorithm based on Realization
+    // Probability" — Tsuruoka, Yokoyama, Chikayama (docx §4.1).
+    let max_moves = if depth <= 1 {
+        moves.len()
+    } else {
+        // RPS beam: search only the top-N most likely moves at the root.
+        // Deeper searches use a smaller beam since each node is expensive.
+        let beam = if depth <= 3 { 24 } else if depth <= 5 { 16 } else { 12 };
+        moves.len().min(beam)
+    };
 
     if depth > 2 {
         let _ = pvs(board, depth - 2, -MATE_SCORE - 1, MATE_SCORE + 1,
@@ -490,17 +505,17 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         return evaluate(board);
     }
 
-    // ── DEPTH-1 LEAF FAST PATH ────────────────────────────────
+    // ── DEPTH-1/2 LEAF FAST PATH ──────────────────────────────
     // On a 36×36 board with ~700 legal moves, generating and legality-
-    // filtering every move at a depth-1 leaf is the dominant cost of the
+    // filtering every move at a depth-1/2 leaf is the dominant cost of the
     // whole search (each apply+is_in_check+undo costs ~2.8ms, so 700 moves
     // ≈ 2s per leaf). Instead, evaluate the position directly with the
     // static evaluator (O(pieces), ~50µs) — far cheaper than generating
-    // and scoring all ~700 pseudo-legal moves. This makes depth-2 search
-    // complete in tens of milliseconds instead of seconds.
+    // and scoring all ~700 pseudo-legal moves. This makes depth-2 and
+    // depth-3 search complete in tens of milliseconds instead of seconds.
     // Reference: HaChu (hgm.nubati.net) — incremental evaluation scales
     // with the board perimeter, not the area.
-    if d == 1 && pruning {
+    if d <= 2 && pruning {
         return evaluate(board);
     }
 
@@ -547,6 +562,15 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         if null_score >= beta { return beta; }
     }
 
+    // ── PROBCUT (depth ≥ 4) ───────────────────────────────────
+    // Statistical pruning: if the static eval is far enough below alpha,
+    // the probability that any move can raise it above beta is negligible.
+    // Reference: "ProbCut" — Kotani, Computer Shogi (docx §3.4).
+    if pruning && d >= 4 && !in_check && alpha > -MATE_SCORE + 100 {
+        let margin = 500 + 300 * d as i32;
+        if static_eval + margin <= alpha { return alpha; }
+    }
+
     // ── INTERNAL ITERATIVE DEEPENING ──────────────────────────
     // If no TT move, do a shallow search to get one
     let iid_move = if tt_move == 0 && d >= 4 && pruning {
@@ -573,12 +597,24 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
 
     // Separate into tactical and quiet for beam search
     let beam = if d <= 1 { 8 } else if d <= 2 { 6 } else if d <= 4 { 4 } else { 3 };
+    // ── REALIZATION PROBABILITY SEARCH (RPS) in internal nodes ──
+    // Only search the top-N most likely moves (ordered by captures, killers,
+    // history). This is the key technique from GEKISASHI (Tsuruoka et al.,
+    // 2002) that won the World Shogi Championship — it reduces the effective
+    // branching factor from ~700 to a small beam, making deeper search
+    // feasible. Reference: docx §4.1.
+    let rps_beam = if d <= 2 { 8 } else if d <= 4 { 6 } else { 4 };
     let mut best: Option<Move> = None;
     let mut tt_flag: u8 = 2; // UPPERBOUND
     let init_alpha = alpha;
     let mut searched = false;
 
     for (move_idx, &(order_score, idx, packed)) in scored.iter().enumerate() {
+        // RPS: stop searching after the top-N moves (unless we're in check
+        // or haven't found a move yet — then search a bit more).
+        if move_idx >= rps_beam && !in_check && searched {
+            break;
+        }
         // Re-check the clock between sibling moves at this node. Without
         // this, a parent node only learns the deadline passed when a
         // recursive pvs() call returns early -- but it would then keep

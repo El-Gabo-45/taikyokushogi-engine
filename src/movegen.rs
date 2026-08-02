@@ -1,6 +1,7 @@
 use crate::types::*;
 use crate::pieces;
 use crate::board::Board;
+use std::sync::OnceLock;
 
 const HOOK_ORTHO_NS: [usize; 2] = [N, S];
 const HOOK_ORTHO_EW: [usize; 2] = [E, W];
@@ -9,12 +10,56 @@ const HOOK_TURN_SE: [usize; 2] = [NE, SW];
 const HOOK_TURN_SW: [usize; 2] = [SE, NW];
 const HOOK_TURN_NW: [usize; 2] = [NE, SW];
 
+// ── PRECOMPUTED JUMP DESTINATIONS ──────────────────────────────
+// HaChu technique: precompute all jump destination squares for each
+// (piece_type, square, color) combination. This eliminates the per-jump
+// bounds checking and arithmetic in gen_jumps, turning it into a simple
+// array lookup. Reference: docx §5.1 — "incremental move generation
+// scales with the board perimeter, not the area".
+//
+// Format: JUMP_TABLE[pt][sq][color] -> &[(dest_sq, is_forward)]
+// We store dest_sq as u16 (INVALID_SQ if off-board).
+static JUMP_TABLE: OnceLock<[[[[u16; 8]; 2]; NUM_SQUARES]; 512]> = OnceLock::new();
+
+fn jump_table() -> &'static [[[[u16; 8]; 2]; NUM_SQUARES]; 512] {
+    JUMP_TABLE.get_or_init(|| {
+        let mut table = [[[[INVALID_SQ; 8]; 2]; NUM_SQUARES]; 512];
+        for pt in 1..=301u16 {
+            let mv = pieces::movement(pt);
+            if mv.jumps.is_empty() { continue; }
+            for sq in 0..NUM_SQUARES {
+                let r = sq_row(sq) as i32;
+                let c = sq_col(sq) as i32;
+                for color in 0..2u8 {
+                    let mut dests = [INVALID_SQ; 8];
+                    for (j, &(jdr, jdc)) in mv.jumps.iter().enumerate() {
+                        if j >= 8 { break; }
+                        let (dr, dc) = if color == BLACK {
+                            (jdr as i32, jdc as i32)
+                        } else {
+                            (-(jdr as i32), -(jdc as i32))
+                        };
+                        let nr = r + dr;
+                        let nc = c + dc;
+                        if nr >= 0 && nr < BOARD_SIZE as i32 && nc >= 0 && nc < BOARD_SIZE as i32 {
+                            dests[j] = (nr as usize * BOARD_SIZE + nc as usize) as u16;
+                        }
+                    }
+                    table[pt as usize][sq][color as usize] = dests;
+                }
+            }
+        }
+        table
+    })
+}
+
 /// Generate pseudo-legal moves (fast, no legality filtering).
 /// Does NOT filter out moves that leave king in check.
 pub fn generate_pseudo_legal_moves(board: &Board) -> Vec<Move> {
     let color = board.side_to_move;
     let c = color as usize;
     let rt = ray_table();
+    let jt = jump_table();
     let mut moves = Vec::with_capacity(512);
 
     for i in 0..board.piece_list_len[c] {
@@ -26,7 +71,7 @@ pub fn generate_pseudo_legal_moves(board: &Board) -> Vec<Move> {
         let mv = pieces::movement(pt);
 
         gen_slides(board, sq, pt, color, mv, rt, &mut moves);
-        gen_jumps(board, sq, pt, color, mv, &mut moves);
+        gen_jumps_fast(board, sq, pt, color, mv, jt, &mut moves);
 
         if mv.hook.is_some() {
             gen_hooks(board, sq, pt, color, mv, rt, &mut moves);
@@ -378,6 +423,31 @@ fn gen_slides(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
     }
 }
 
+/// Fast jump generation using precomputed destination table.
+/// Eliminates per-jump bounds checking and arithmetic — just a lookup
+/// into JUMP_TABLE[pt][sq][color] followed by an occupancy check.
+fn gen_jumps_fast(
+    board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
+    jt: &[[[[u16; 8]; 2]; NUM_SQUARES]; 512],
+    moves: &mut Vec<Move>,
+) {
+    if mv.jumps.is_empty() { return; }
+    let dests = &jt[pt as usize][sq][color as usize];
+    for j in 0..mv.jumps.len().min(8) {
+        let nsq = dests[j];
+        if nsq == INVALID_SQ { continue; }
+        let nsq_u = nsq as usize;
+        let target = board.cells[nsq_u];
+        if target == EMPTY_CELL {
+            add_move(moves, sq as u16, nsq, pt, color, EMPTY_CELL);
+        } else if cell_color(target) != color {
+            add_move(moves, sq as u16, nsq, pt, color, target);
+        }
+    }
+}
+
+/// Original gen_jumps — kept for reference/debugging.
+#[allow(dead_code)]
 fn gen_jumps(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
              moves: &mut Vec<Move>) {
     let r = sq_row(sq) as i32;
