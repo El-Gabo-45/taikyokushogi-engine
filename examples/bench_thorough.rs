@@ -31,9 +31,12 @@ struct RunStats {
 fn run_search(board: &mut Board, depth: u32, time_limit_ms: u64) -> RunStats {
     let t = Instant::now();
     let result = board.search(depth, time_limit_ms);
-    let elapsed_ms = t.elapsed().as_millis() as u64;
-    let nps = if elapsed_ms > 0 {
-        result.nodes as f64 / (elapsed_ms as f64 / 1000.0)
+    let elapsed_us = t.elapsed().as_micros() as u64;
+    let elapsed_ms = elapsed_us / 1000;
+    // Use microseconds for NPS calculation so sub-millisecond searches
+    // report a real NPS instead of 0.
+    let nps = if elapsed_us > 0 {
+        result.nodes as f64 / (elapsed_us as f64 / 1_000_000.0)
     } else {
         0.0
     };
