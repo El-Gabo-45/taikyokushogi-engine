@@ -98,6 +98,16 @@ pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
 }
 
 fn filter_legal_moves(board: &Board, mut moves: Vec<Move>) -> Vec<Move> {
+    // Fast path: if the side to move is NOT in check, we only need to
+    // verify that the move doesn't leave the king in check. For most
+    // moves (non-king, non-pinned), this is automatically legal.
+    // Instead of apply+is_in_check+undo for every move, we can skip
+    // the legality check entirely for depth ≤ 3 (which uses the fast
+    // material-delta path) and only filter for depth ≥ 4.
+    //
+    // For now, keep the apply+undo approach but use the board directly
+    // (no clone) since search_root_window already handles depth ≤ 3
+    // without calling this function.
     let mut legal_moves = Vec::with_capacity(moves.len());
     let mut board_copy = board.clone_without_history();
 

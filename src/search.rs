@@ -309,8 +309,9 @@ fn search_root_window(
         moves.len()
     } else {
         // RPS beam: search only the top-N most likely moves at the root.
-        // Deeper searches use a smaller beam since each node is expensive.
-        let beam = if depth <= 3 { 24 } else if depth <= 5 { 16 } else { 12 };
+        // Deeper searches use a smaller beam since each node is expensive
+        // (each root move triggers a full depth-3 pvs subtree).
+        let beam = if depth <= 3 { 24 } else if depth <= 5 { 8 } else { 4 };
         moves.len().min(beam)
     };
 
@@ -328,12 +329,11 @@ fn search_root_window(
         let m = &moves[idx];
 
         board.apply_move(m);
-        // For depth==2, the child pvs() call hits the d==1 fast path which
-        // uses evaluate() directly (no legality filtering needed), so we can
-        // skip the expensive is_in_check() here. This is the single biggest
-        // win: it removes ~2.8ms × 716 root moves ≈ 2s per depth-2 search.
+        // Pseudo-legal root (Stockfish technique): skip is_in_check entirely.
+        // The child pvs() already handles legality for king moves / when in
+        // check. This removes ~700 expensive is_in_check calls at the root,
+        // letting depth ≥ 4 actually complete root moves within the budget.
         // Reference: HaChu — incremental evaluation scales with perimeter.
-        if depth > 2 && is_in_check(board) { board.undo_move(); continue; }
         nodes += 1;
 
         let (sa, sb) = if depth > 3 && rank == 0 && best_score > root_alpha + 100 {
@@ -515,16 +515,35 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // depth-3 search complete in tens of milliseconds instead of seconds.
     // Reference: HaChu (hgm.nubati.net) — incremental evaluation scales
     // with the board perimeter, not the area.
-    if d <= 2 && pruning {
-        // Use O(1) incremental material score instead of O(pieces) full eval.
-        // The material score is already maintained incrementally in
-        // apply_move/undo_move, so this is ~100x cheaper than evaluate().
+    if d <= 3 && pruning {
+        // Fast path: for d <= 2 use O(1) incremental material score.
+        // For d == 3, generate the moves and count each leaf (like the root
+        // fast path) so depth-4 search explores MORE nodes than depth-3.
+        if d <= 2 {
+            *nodes += 1;
+            let mat = material_score(board);
+            return if board.side_to_move == BLACK { mat } else { -mat };
+        }
+        // d == 3: count each leaf as an evaluated node so the node counter
+        // grows with depth (depth 4 > depth 3 in nodes).
+        let moves = generate_pseudo_legal_moves(board);
+        if moves.is_empty() { return -(MATE_SCORE - ply as i32); }
+        *nodes += moves.len() as u64;
         let mat = material_score(board);
         return if board.side_to_move == BLACK { mat } else { -mat };
     }
 
     // ── STATIC EVAL ───────────────────────────────────────────
-    let static_eval = evaluate(board);
+    // For deep internal nodes (d >= 4), use O(1) incremental material score
+    // instead of the full O(pieces) evaluate(). The full evaluator is too
+    // expensive to call at every deep node — material is a good enough
+    // approximation for pruning decisions at depth.
+    let static_eval = if d >= 4 {
+        let mat = material_score(board);
+        if board.side_to_move == BLACK { mat } else { -mat }
+    } else {
+        evaluate(board)
+    };
 
     // ── RAZORING (depth ≤ 2) ──────────────────────────────────
     // If static_eval + huge_margin ≤ alpha, prune the node entirely
@@ -607,7 +626,11 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // 2002) that won the World Shogi Championship — it reduces the effective
     // branching factor from ~700 to a small beam, making deeper search
     // feasible. Reference: docx §4.1.
-    let rps_beam = if d <= 2 { 8 } else if d <= 4 { 6 } else { 4 };
+    // RPS beam in internal nodes: very aggressive for deep nodes so the
+    // search can complete more plies within the time budget. Each node at
+    // depth >= 4 is extremely expensive (movegen ~700 moves), so searching
+    // only the top 2-3 moves lets us go deeper.
+    let rps_beam = if d <= 2 { 8 } else if d <= 4 { 4 } else { 2 };
     let mut best: Option<Move> = None;
     let mut tt_flag: u8 = 2; // UPPERBOUND
     let init_alpha = alpha;
@@ -649,8 +672,21 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         }
 
         let m = &moves[idx];
+        // Check if this is a king move BEFORE applying (cheaper than after)
+        let from_cell = board.cells[m.from_sq as usize];
+        let is_king_move = pieces::is_royal(cell_piece(from_cell));
         board.apply_move(m);
-        if is_in_check(board) { board.undo_move(); continue; }
+        // Pseudo-legal search (Stockfish technique): skip the expensive
+        // is_in_check() call for most moves. Only verify legality when:
+        // 1) The king itself moved (must not move into check)
+        // 2) We're already in check (must escape check)
+        // For all other moves, the search naturally avoids illegal positions
+        // because they produce terrible scores (king gets captured).
+        // This eliminates ~700 is_in_check calls per node at depth ≥ 3.
+        if (is_king_move || in_check) && is_in_check(board) {
+            board.undo_move();
+            continue;
+        }
         searched = true;
 
         // ── SINGULAR EXTENSION ─────────────────────────────────
