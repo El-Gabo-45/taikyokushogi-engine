@@ -42,6 +42,7 @@ mod types;
 mod pieces;
 mod board;
 mod movegen;
+mod attack;
 mod eval;
 pub mod search;
 mod tsfen;

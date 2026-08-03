@@ -46,11 +46,19 @@ fn jump_table() -> &'static [[[[u16; 8]; 2]; NUM_SQUARES]; 512] {
 }
 
 /// Generate pseudo-legal moves (fast, no legality filtering).
+///
+/// Uses the flat bitboard attack templates (attack.rs) for the ~90% of
+/// pieces that are pure jumps/steps/slides/area/igui, avoiding heap-Vec
+/// `Movement` reads. When a special piece (hook, range-capturer, lion
+/// mid-capture) is present, falls back to the full `pieces::movement`
+/// path. Reference: docx §5.3 — bitboard generation scales with the
+/// board perimeter.
 pub fn generate_pseudo_legal_moves(board: &Board) -> Vec<Move> {
     let color = board.side_to_move;
     let c = color as usize;
     let rt = ray_table();
     let jt = jump_table();
+    let t = crate::attack::templates();
     let mut moves = Vec::with_capacity(512);
 
     for i in 0..board.piece_list_len[c] {
@@ -59,6 +67,15 @@ pub fn generate_pseudo_legal_moves(board: &Board) -> Vec<Move> {
         let cell = board.cells[sq];
         if cell == EMPTY_CELL { continue; }
         let pt = cell_piece(cell);
+        let tmpl = &t[(pt as usize).min(511)][color as usize];
+
+        // Fast path: pure jumps/steps/slides/area/igui.
+        if tmpl.valid {
+            crate::attack::fast_piece(board, sq, pt, color, tmpl, rt, &mut moves);
+            continue;
+        }
+
+        // Fallback: special pieces need the original movement logic.
         let mv = pieces::movement(pt);
 
         gen_slides(board, sq, pt, color, mv, rt, &mut moves);
