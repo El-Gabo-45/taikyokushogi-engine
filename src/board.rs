@@ -1,7 +1,9 @@
+
 use crate::types::*;
 use crate::pieces;
 use crate::bitboard::Bitboard1296;
 use crate::bitboard::U64_COUNT;
+use crate::eval::psqt;
 
 pub struct Board {
     pub cells: [Cell; NUM_SQUARES],
@@ -26,6 +28,9 @@ pub struct Board {
     // This makes material_score() O(1) instead of O(pieces).
     // Reference: Chess Programming Wiki, "Incremental Updates".
     pub material_score: i32,
+    /// Incremental PSQT score from Black's perspective. Combines material,
+    /// family weight, and zone bonuses. Makes evaluate() near O(1).
+    pub psqt_score: i32,
     // Undo stack
     history: Vec<UndoInfo>,
     // ── BITBOARD OCCUPANCY ────────────────────────────────────────
@@ -49,6 +54,7 @@ impl Clone for Board {
             piece_index: self.piece_index,
             hash: self.hash,
             material_score: self.material_score,
+            psqt_score: self.psqt_score,
             history: self.history.clone(),
             occupancy: self.occupancy,
             all_occupancy: self.all_occupancy,
@@ -77,6 +83,7 @@ impl Board {
             piece_index: self.piece_index,
             hash: self.hash,
             material_score: self.material_score,
+            psqt_score: self.psqt_score,
             history: Vec::new(),
             occupancy: self.occupancy,
             all_occupancy: self.all_occupancy,
@@ -99,6 +106,7 @@ impl Board {
             piece_index: [INVALID_SQ; NUM_SQUARES],
             hash: 0,
             material_score: 0,
+            psqt_score: 0,
             history: Vec::new(),
             occupancy: [Bitboard1296::new(), Bitboard1296::new()],
             all_occupancy: Bitboard1296::new(),
@@ -118,6 +126,7 @@ impl Board {
         self.piece_index = [INVALID_SQ; NUM_SQUARES];
         self.hash = 0;
         self.material_score = 0;
+        self.psqt_score = 0;
         self.history.clear();
         self.occupancy = [Bitboard1296::new(), Bitboard1296::new()];
         self.all_occupancy = Bitboard1296::new();
@@ -166,6 +175,11 @@ impl Board {
         if color == BLACK { self.material_score += val; }
         else { self.material_score -= val; }
 
+        // Update incremental PSQT score
+        let psq = psqt::psqt(pt, sq, color);
+        if color == BLACK { self.psqt_score += psq; }
+        else { self.psqt_score -= psq; }
+
         if pieces::is_royal(pt) {
             let ri = self.royal_count[c];
             self.royal_list[c][ri] = sq as u16;
@@ -201,6 +215,7 @@ impl Board {
             no_progress_plies: self.no_progress_plies,
             hash: self.hash,
             material_score: self.material_score,
+            psqt_score: self.psqt_score,
         };
 
         let is_capture = to_cell != EMPTY_CELL
@@ -227,6 +242,11 @@ impl Board {
                     let cap_c = cell_color(cap_cell);
                     if cap_c == BLACK { self.material_score -= cap_val; }
                     else { self.material_score += cap_val; }
+                    // Update incremental PSQT score
+                    let cap_pt = cell_piece(cap_cell);
+                    let cap_psq = psqt::psqt(cap_pt, sq as usize, cap_c);
+                    if cap_c == BLACK { self.psqt_score -= cap_psq; }
+                    else { self.psqt_score += cap_psq; }
                 }
                 self.remove_from_lists(sq as usize);
                 self.cells[sq as usize] = EMPTY_CELL;
@@ -246,6 +266,11 @@ impl Board {
                 let mid_c = cell_color(undo.mid_cell);
                 if mid_c == BLACK { self.material_score -= mid_val; }
                 else { self.material_score += mid_val; }
+                // Update incremental PSQT score
+                let mid_pt = cell_piece(undo.mid_cell);
+                let mid_psq = psqt::psqt(mid_pt, msq, mid_c);
+                if mid_c == BLACK { self.psqt_score -= mid_psq; }
+                else { self.psqt_score += mid_psq; }
             }
             self.remove_from_lists(msq);
             self.cells[msq] = EMPTY_CELL;
@@ -261,6 +286,11 @@ impl Board {
                 let cap_c = cell_color(to_cell);
                 if cap_c == BLACK { self.material_score -= cap_val; }
                 else { self.material_score += cap_val; }
+                // Update incremental PSQT score
+                let cap_pt = cell_piece(to_cell);
+                let cap_psq = psqt::psqt(cap_pt, to, cap_c);
+                if cap_c == BLACK { self.psqt_score -= cap_psq; }
+                else { self.psqt_score += cap_psq; }
                 self.remove_from_lists(to);
                 self.cells[to] = EMPTY_CELL;
             }
@@ -273,6 +303,12 @@ impl Board {
                     let delta = new_val - old_val;
                     if color == BLACK { self.material_score += delta; }
                     else { self.material_score -= delta; }
+                    // Update incremental PSQT score for promotion
+                    let old_psq = psqt::psqt(pt, from, color);
+                    let new_psq = psqt::psqt(promo_pt, from, color);
+                    let psq_delta = new_psq - old_psq;
+                    if color == BLACK { self.psqt_score += psq_delta; }
+                    else { self.psqt_score -= psq_delta; }
                     let new_cell = make_cell(promo_pt, color);
                     self.cells[from] = new_cell;
                     self.hash ^= zobrist_piece_key(promo_pt, from, color);
@@ -290,6 +326,10 @@ impl Board {
         self.hash ^= zobrist_piece_key(pt, from, color);
         self.cells[from] = EMPTY_CELL;
         self.remove_sq_from_piece_list(from, c);
+        // Update incremental PSQT score for origin
+        let from_psq = psqt::psqt(pt, from, color);
+        if color == BLACK { self.psqt_score -= from_psq; }
+        else { self.psqt_score += from_psq; }
         // Update bitboards for from-square
         self.occupancy[c].clear_usize(from);
         self.all_occupancy.clear_usize(from);
@@ -306,6 +346,11 @@ impl Board {
             let cap_c = cell_color(to_cell);
             if cap_c == BLACK { self.material_score -= cap_val; }
             else { self.material_score += cap_val; }
+            // Update incremental PSQT score
+            let cap_pt = cell_piece(to_cell);
+            let cap_psq = psqt::psqt(cap_pt, to, cap_c);
+            if cap_c == BLACK { self.psqt_score -= cap_psq; }
+            else { self.psqt_score += cap_psq; }
             self.remove_from_lists(to);
             // Bitboard cleanup for captured piece is handled in remove_from_lists
         }
@@ -324,6 +369,11 @@ impl Board {
             if color == BLACK { self.material_score += delta; }
             else { self.material_score -= delta; }
         }
+
+        // Update incremental PSQT score for destination (accounting for promotion)
+        let to_psq = psqt::psqt(final_pt, to, color);
+        if color == BLACK { self.psqt_score += to_psq; }
+        else { self.psqt_score -= to_psq; }
 
         // Place at destination
         self.hash ^= zobrist_piece_key(final_pt, to, color);
@@ -355,6 +405,7 @@ impl Board {
         self.move_number = undo.move_number;
         self.no_progress_plies = undo.no_progress_plies;
         self.material_score = undo.material_score;
+        self.psqt_score = undo.psqt_score;
 
         let from = undo.from_sq as usize;
         let to = undo.to_sq as usize;
@@ -460,6 +511,7 @@ impl Board {
         self.occupancy = [Bitboard1296::new(), Bitboard1296::new()];
         self.all_occupancy = Bitboard1296::new();
         self.material_score = 0;
+        self.psqt_score = 0;
 
         for sq in 0..NUM_SQUARES {
             let cell = self.cells[sq];
@@ -478,6 +530,10 @@ impl Board {
                 let val = pieces::value(pt) as i32;
                 if color == BLACK { self.material_score += val; }
                 else { self.material_score -= val; }
+                // Rebuild PSQT score
+                let psq = psqt::psqt(pt, sq, color);
+                if color == BLACK { self.psqt_score += psq; }
+                else { self.psqt_score -= psq; }
                 if pieces::is_royal(pt) {
                     let ri = self.royal_count[c];
                     self.royal_list[c][ri] = sq as u16;
@@ -612,6 +668,7 @@ impl Board {
             no_progress_plies: self.no_progress_plies,
             hash: self.hash,
             material_score: self.material_score,
+            psqt_score: self.psqt_score,
         };
         self.no_progress_plies += 1;
         self.side_to_move = 1 - self.side_to_move;
@@ -627,6 +684,7 @@ impl Board {
             self.move_number = undo.move_number;
             self.no_progress_plies = undo.no_progress_plies;
             self.material_score = undo.material_score;
+            self.psqt_score = undo.psqt_score;
         }
     }
 }

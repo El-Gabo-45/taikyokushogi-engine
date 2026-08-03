@@ -19,12 +19,10 @@
 pub mod families;
 pub mod zones;
 pub mod nnue;
+pub mod psqt;
 
 use crate::board::Board;
 use crate::types::*;
-use crate::pieces;
-use crate::eval::families::family_value_fast;
-use crate::eval::zones::zone_score;
 
 pub const MATE_SCORE: i32 = 1_000_000;
 
@@ -74,27 +72,12 @@ pub fn evaluate(board: &Board) -> i32 {
         return nnue::nnue_evaluate_from_scratch(board);
     }
 
-    // Material + family weight (uses precomputed family_value_fast table).
-    let mut score = 0;
-    for c in 0..2 {
-        let sign: i32 = if c == BLACK as usize { 1 } else { -1 };
-        for i in 0..board.piece_list_len[c] {
-            let sq = board.piece_list[c][i] as usize;
-            if sq == INVALID_SQ as usize { continue; }
-            let cell = board.cells[sq];
-            if cell == EMPTY_CELL { continue; }
-            let pt = cell_piece(cell);
-            score += sign * family_value_fast(pt);
-        }
-    }
-
-    // Zone bonuses.
-    score += zone_score(board, BLACK);
-    score -= zone_score(board, WHITE);
-
-    // King safety (simple: penalize exposed king).
-    score += king_safety(board, BLACK);
-    score -= king_safety(board, WHITE);
+    // Incremental PSQT score (combines material + family weight + zone
+    // bonuses). Maintained O(1) in apply_move/undo_move — no O(pieces)
+    // scan needed.
+    let score = board.psqt_score
+        + king_safety(board, BLACK)
+        - king_safety(board, WHITE);
 
     // Return from side-to-move perspective.
     if board.side_to_move == BLACK { score } else { -score }

@@ -2,6 +2,7 @@ use crate::types::*;
 use crate::pieces;
 use crate::board::Board;
 use crate::movegen::generate_pseudo_legal_moves;
+use crate::movegen::generate_pseudo_legal_captures;
 use crate::movegen::is_in_check;
 use crate::eval::{evaluate, material_score, MATE_SCORE};
 use std::sync::atomic::{AtomicU64, AtomicI32, Ordering};
@@ -311,7 +312,7 @@ fn search_root_window(
         // RPS beam: search only the top-N most likely moves at the root.
         // Deeper searches use a smaller beam since each node is expensive
         // (each root move triggers a full depth-3 pvs subtree).
-        let beam = if depth <= 3 { 24 } else if depth <= 5 { 8 } else { 4 };
+        let beam = if depth <= 3 { 32 } else if depth <= 5 { 12 } else { 6 };
         moves.len().min(beam)
     };
 
@@ -516,34 +517,25 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // Reference: HaChu (hgm.nubati.net) — incremental evaluation scales
     // with the board perimeter, not the area.
     if d <= 3 && pruning {
-        // Fast path: for d <= 2 use O(1) incremental material score.
-        // For d == 3, generate the moves and count each leaf (like the root
-        // fast path) so depth-4 search explores MORE nodes than depth-3.
+        // Fast path: all d <= 3 now use the O(1) incremental PSQT
+        // evaluator (material + family weight + zone bonus).
         if d <= 2 {
             *nodes += 1;
-            let mat = material_score(board);
-            return if board.side_to_move == BLACK { mat } else { -mat };
+            return evaluate(board);
         }
         // d == 3: count each leaf as an evaluated node so the node counter
         // grows with depth (depth 4 > depth 3 in nodes).
         let moves = generate_pseudo_legal_moves(board);
         if moves.is_empty() { return -(MATE_SCORE - ply as i32); }
         *nodes += moves.len() as u64;
-        let mat = material_score(board);
-        return if board.side_to_move == BLACK { mat } else { -mat };
+        return evaluate(board);
     }
 
     // ── STATIC EVAL ───────────────────────────────────────────
-    // For deep internal nodes (d >= 4), use O(1) incremental material score
-    // instead of the full O(pieces) evaluate(). The full evaluator is too
-    // expensive to call at every deep node — material is a good enough
-    // approximation for pruning decisions at depth.
-    let static_eval = if d >= 4 {
-        let mat = material_score(board);
-        if board.side_to_move == BLACK { mat } else { -mat }
-    } else {
-        evaluate(board)
-    };
+    // With the incremental PSQT score, evaluate() is O(1) (just a couple
+    // of table lookups + the king-safety term). Use it at every node —
+    // no need for the cheaper-but-cruder material-only approximation.
+    let static_eval = evaluate(board);
 
     // ── RAZORING (depth ≤ 2) ──────────────────────────────────
     // If static_eval + huge_margin ≤ alpha, prune the node entirely
@@ -616,7 +608,6 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         let s = score_move(m, iid_move, hist, cntr, d);
         scored.push((s, i, packed));
     }
-    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
     // Separate into tactical and quiet for beam search
     let beam = if d <= 1 { 8 } else if d <= 2 { 6 } else if d <= 4 { 4 } else { 3 };
@@ -630,7 +621,22 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // search can complete more plies within the time budget. Each node at
     // depth >= 4 is extremely expensive (movegen ~700 moves), so searching
     // only the top 2-3 moves lets us go deeper.
-    let rps_beam = if d <= 2 { 8 } else if d <= 4 { 4 } else { 2 };
+    let rps_beam = if d <= 2 { 12 } else if d <= 4 { 6 } else { 3 };
+
+    // ── PARTIAL SELECTION (instead of full sort) ─────────────
+    // We only search the top `rps_beam` moves (plus a few for dynamic
+    // widening). A full sort of all ~700 moves is O(n log n) and wastes
+    // ~99% of the work since we never touch the tail. Instead, use
+    // select_nth_unstable to partition so the top-N are at the front —
+    // O(n) average, and the tail stays unsorted (we never read it).
+    // Reference: "Partial selection" — Chess Programming Wiki, Move
+    // Ordering (only the top moves need to be ordered).
+    let select_n = (rps_beam + 2).min(scored.len());
+    if select_n > 1 && scored.len() > select_n {
+        scored.select_nth_unstable_by(select_n - 1, |a, b| b.0.cmp(&a.0));
+    } else {
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    }
     let mut best: Option<Move> = None;
     let mut tt_flag: u8 = 2; // UPPERBOUND
     let init_alpha = alpha;
@@ -750,9 +756,13 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     }
 
     // ── DYNAMIC WIDENING ──────────────────────────────────────
-    // If no move raised alpha (fail-low), search more moves
+    // If no move raised alpha (fail-low), search more moves.
+    // Only the first `select_n` entries are sorted (top-N); the tail is
+    // unsorted after select_nth_unstable, so we only widen within the
+    // sorted prefix.
     if !searched || (alpha <= init_alpha && !best.is_some()) {
-        for &(_score, idx, packed) in &scored[beam..scored.len().min(beam * 2)] {
+        let widen_end = scored.len().min(select_n);
+        for &(_score, idx, packed) in &scored[beam..widen_end] {
             if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
             let m = &moves[idx];
             board.apply_move(m);
@@ -832,14 +842,14 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
     if stand_pat > alpha { alpha = stand_pat; }
     if qd >= MAX_QDEPTH { return alpha; }
 
-    // Generate only captures and promotions
-    let moves = generate_pseudo_legal_moves(board);
+    // Generate only captures and promotions (staged move generation —
+    // Reference: docx §3.2 Futility Pruning & §4.4 Quiescence Search).
+    // The capture-only generator skips the ~700 quiet moves, so QS now
+    // scales with the number of pieces that can actually capture.
+    let moves = generate_pseudo_legal_captures(board);
     let values = piece_vals();
     let mut scored: Vec<(i32, usize)> = Vec::with_capacity(moves.len());
     for (i, m) in moves.iter().enumerate() {
-        if m.captured_piece == 0 && m.mid_piece == 0 && !m.is_igui && !m.promotion {
-            continue;
-        }
         let s = capture_qs_score(board, m, values);
         if s < -300 {
             continue;

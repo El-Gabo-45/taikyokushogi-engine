@@ -204,6 +204,8 @@ pub struct UndoInfo {
     /// Incremental material score snapshot for fast undo.
     /// Reference: Chess Programming Wiki, "Incremental Updates".
     pub material_score: i32,
+    /// Incremental PSQT score snapshot for fast undo.
+    pub psqt_score: i32,
 }
 
 // ============================================================
