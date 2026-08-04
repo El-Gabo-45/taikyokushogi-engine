@@ -458,12 +458,12 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
 
         let result = if current_depth <= 1 {
             search_root_window(board, current_depth, deadline, root_hint, -MATE_SCORE - 1, MATE_SCORE + 1)
-        } else {
+        } else if current_depth <= 4 {
+            // Shallow depths: small aspiration window is fine.
             let mut window = 64i32;
             let mut alpha = score_guess.saturating_sub(window);
             let mut beta = score_guess.saturating_add(window);
             let mut local_result;
-
             loop {
                 local_result = search_root_window(board, current_depth, deadline, root_hint, alpha, beta);
                 if let Some(dl) = deadline {
@@ -484,6 +484,12 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
                 break;
             }
             local_result
+        } else {
+            // Deep searches (d >= 5): use full window to avoid expensive
+            // aspiration re-searches. On a 36×36 board, each root search
+            // is costly enough that re-searching 4-8 times blows the time
+            // budget. The full window is cheaper than multiple re-searches.
+            search_root_window(board, current_depth, deadline, root_hint, -MATE_SCORE - 1, MATE_SCORE + 1)
         };
 
         if deadline.map(|dl| Instant::now() >= dl).unwrap_or(false) { break; }
@@ -571,12 +577,12 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // depth-3 search complete in tens of milliseconds instead of seconds.
     // Reference: HaChu (hgm.nubati.net) — incremental evaluation scales
     // with the board perimeter, not the area.
-    if d <= 5 && pruning {
-        // Fast path: all d <= 5 use the O(1) incremental PSQT evaluator
-        // (material + family weight + zone bonus). No movegen needed —
-        // generating ~700 moves at every shallow leaf is the dominant cost
-        // of deep search. Reference: HaChu — incremental evaluation scales
-        // with the board perimeter, not the area.
+    if d <= 3 && pruning {
+        // Leaf fast path: evaluate directly with the O(1) incremental PSQT
+        // evaluator. No movegen — generating ~700 moves at every shallow
+        // leaf is the dominant cost of the whole search.
+        // Reference: HaChu — incremental evaluation scales with the board
+        // perimeter, not the area.
         *nodes += 1;
         return evaluate(board);
     }
