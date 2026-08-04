@@ -281,39 +281,47 @@ fn search_root_window(
     let mut nodes: u64 = 0;
     let mut best_move = None;
     let mut best_score = -MATE_SCORE - 1;
-    let moves = generate_pseudo_legal_moves(board);
-
-    if moves.is_empty() {
-        return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: start.elapsed().as_millis() as u64 };
-    }
-
     let root_tt_move = tt_probe(board.hash).map(|(_, mv)| mv).unwrap_or(0);
-    let mut scored: Vec<(i32, usize)> = Vec::with_capacity(moves.len());
-    for (i, m) in moves.iter().enumerate() {
-        let packed = m_pack(m);
-        let hist = history_score(m.from_sq as usize, m.to_sq as usize);
-        let mut s = score_move(m, root_tt_move, hist, 0, depth);
-        if root_hint == Some(packed) { s += 3_000_000; }
-        scored.push((s, i));
-    }
-    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
-    // ── REALIZATION PROBABILITY SEARCH (RPS) ──────────────────
-    // Instead of searching all ~700 legal moves at the root, only search
-    // the top-N moves ordered by score (captures, killers, history). This
-    // is the key technique from GEKISASHI (Tsuruoka et al., 2002) that won
-    // the World Shogi Championship — it reduces the effective branching
-    // factor from ~700 to a small beam, making deeper search feasible.
-    // Reference: "Game-Tree Search Algorithm based on Realization
-    // Probability" — Tsuruoka, Yokoyama, Chikayama (docx §4.1).
+    // ── ROOT-LEVEL STAGED GENERATION ──────────────────────────
+    // Generate captures first (cheap, ~10-50 moves), search them. Only if
+    // no beta cutoff is found do we generate the full quiet move list
+    // (~700 moves). This avoids generating + sorting all ~700 root moves
+    // when a capture already causes a cutoff — the dominant cost of deep
+    // search. Reference: docx §3.2 Futility Pruning & §4.4 Quiescence.
     let max_moves = if depth <= 1 {
-        moves.len()
+        // Depth 1: search all moves (cheap material-delta path).
+        let moves = generate_pseudo_legal_moves(board);
+        if moves.is_empty() {
+            return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: start.elapsed().as_millis() as u64 };
+        }
+        let mut scored: Vec<(i32, usize)> = Vec::with_capacity(moves.len());
+        for (i, m) in moves.iter().enumerate() {
+            let packed = m_pack(m);
+            let hist = history_score(m.from_sq as usize, m.to_sq as usize);
+            let mut s = score_move(m, root_tt_move, hist, 0, depth);
+            if root_hint == Some(packed) { s += 3_000_000; }
+            scored.push((s, i));
+        }
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for rank in 0..scored.len() {
+            let idx = scored[rank].1;
+            let m = &moves[idx];
+            board.apply_move(m);
+            nodes += 1;
+            let score = -pvs(board, depth - 1, -MATE_SCORE - 1, MATE_SCORE + 1,
+                            &mut nodes, deadline, 0, true, m_pack(m));
+            board.undo_move();
+            if score > best_score {
+                best_score = score;
+                best_move = Some(m.clone());
+            }
+        }
+        return SearchResult { best_move, score: best_score, nodes, time_ms: start.elapsed().as_millis() as u64 };
     } else {
         // RPS beam: search only the top-N most likely moves at the root.
-        // Deeper searches use a smaller beam since each node is expensive
-        // (each root move triggers a full depth-3 pvs subtree).
         let beam = if depth <= 3 { 32 } else if depth <= 5 { 12 } else { 6 };
-        moves.len().min(beam)
+        beam
     };
 
     if depth > 2 {
@@ -321,54 +329,101 @@ fn search_root_window(
                     &mut nodes, deadline, 0, true, 0);
     }
 
-    for rank in 0..max_moves {
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl { break; }
-        }
+    // Stage 1: captures + promotions (tactical moves).
+    let cap_moves = generate_pseudo_legal_captures(board);
+    let mut cap_scored: Vec<(i32, usize)> = Vec::with_capacity(cap_moves.len());
+    for (i, m) in cap_moves.iter().enumerate() {
+        let packed = m_pack(m);
+        let hist = history_score(m.from_sq as usize, m.to_sq as usize);
+        let mut s = score_move(m, root_tt_move, hist, 0, depth);
+        if root_hint == Some(packed) { s += 3_000_000; }
+        cap_scored.push((s, i));
+    }
+    cap_scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
-        let idx = scored[rank].1;
-        let m = &moves[idx];
-
+    for rank in 0..cap_scored.len().min(max_moves) {
+        if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
+        let idx = cap_scored[rank].1;
+        let m = &cap_moves[idx];
         board.apply_move(m);
-        // Pseudo-legal root (Stockfish technique): skip is_in_check entirely.
-        // The child pvs() already handles legality for king moves / when in
-        // check. This removes ~700 expensive is_in_check calls at the root,
-        // letting depth ≥ 4 actually complete root moves within the budget.
-        // Reference: HaChu — incremental evaluation scales with perimeter.
         nodes += 1;
-
-        let (sa, sb) = if depth > 3 && rank == 0 && best_score > root_alpha + 100 {
+        let (sa, sb) = if rank == 0 && best_score > root_alpha + 100 {
             (best_score - 50, best_score + 50)
         } else {
             (-MATE_SCORE - 1, -best_score.max(-MATE_SCORE - 1))
         };
-
         let score = if rank == 0 {
             -pvs(board, depth - 1, sa, sb, &mut nodes, deadline, 0, true, m_pack(m))
         } else {
             let nw = -pvs(board, depth - 1, -sa - 1, -sa, &mut nodes, deadline, 0, true, m_pack(m));
             if nw > sa && nw < sb {
                 -pvs(board, depth - 1, -sb, -sa, &mut nodes, deadline, 0, true, m_pack(m))
-            } else {
-                nw
-            }
+            } else { nw }
         };
-
         if score <= sa || score >= sb {
             let full = -pvs(board, depth - 1, -MATE_SCORE - 1,
                             -best_score.max(-MATE_SCORE - 1),
                             &mut nodes, deadline, 0, true, m_pack(m));
-            if full > best_score {
-                best_score = full;
-                best_move = Some(m.clone());
-            }
+            if full > best_score { best_score = full; best_move = Some(m.clone()); }
         } else if score > best_score {
             best_score = score;
             best_move = Some(m.clone());
         }
-
         board.undo_move();
         if best_score >= root_beta { break; }
+    }
+
+    // Stage 2: quiet moves (only if no beta cutoff from captures).
+    if best_score < root_beta {
+        let moves = generate_pseudo_legal_moves(board);
+        if moves.is_empty() {
+            return SearchResult { best_move, score: best_score, nodes, time_ms: start.elapsed().as_millis() as u64 };
+        }
+        let mut scored: Vec<(i32, usize)> = Vec::with_capacity(moves.len());
+        for (i, m) in moves.iter().enumerate() {
+            let packed = m_pack(m);
+            let hist = history_score(m.from_sq as usize, m.to_sq as usize);
+            let mut s = score_move(m, root_tt_move, hist, 0, depth);
+            if root_hint == Some(packed) { s += 3_000_000; }
+            scored.push((s, i));
+        }
+        let select_n = (max_moves + 2).min(scored.len());
+        if select_n > 1 && scored.len() > select_n {
+            scored.select_nth_unstable_by(select_n - 1, |a, b| b.0.cmp(&a.0));
+        } else {
+            scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        }
+        for rank in 0..scored.len().min(max_moves) {
+            if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
+            let idx = scored[rank].1;
+            let m = &moves[idx];
+            board.apply_move(m);
+            nodes += 1;
+            let (sa, sb) = if rank == 0 && best_score > root_alpha + 100 {
+                (best_score - 50, best_score + 50)
+            } else {
+                (-MATE_SCORE - 1, -best_score.max(-MATE_SCORE - 1))
+            };
+            let score = if rank == 0 {
+                -pvs(board, depth - 1, sa, sb, &mut nodes, deadline, 0, true, m_pack(m))
+            } else {
+                let nw = -pvs(board, depth - 1, -sa - 1, -sa, &mut nodes, deadline, 0, true, m_pack(m));
+                if nw > sa && nw < sb {
+                    -pvs(board, depth - 1, -sb, -sa, &mut nodes, deadline, 0, true, m_pack(m))
+                } else { nw }
+            };
+            if score <= sa || score >= sb {
+                let full = -pvs(board, depth - 1, -MATE_SCORE - 1,
+                                -best_score.max(-MATE_SCORE - 1),
+                                &mut nodes, deadline, 0, true, m_pack(m));
+                if full > best_score { best_score = full; best_move = Some(m.clone()); }
+            } else if score > best_score {
+                best_score = score;
+                best_move = Some(m.clone());
+            }
+            board.undo_move();
+            if best_score >= root_beta { break; }
+        }
     }
 
     SearchResult {
@@ -516,18 +571,13 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // depth-3 search complete in tens of milliseconds instead of seconds.
     // Reference: HaChu (hgm.nubati.net) — incremental evaluation scales
     // with the board perimeter, not the area.
-    if d <= 3 && pruning {
-        // Fast path: all d <= 3 now use the O(1) incremental PSQT
-        // evaluator (material + family weight + zone bonus).
-        if d <= 2 {
-            *nodes += 1;
-            return evaluate(board);
-        }
-        // d == 3: count each leaf as an evaluated node so the node counter
-        // grows with depth (depth 4 > depth 3 in nodes).
-        let moves = generate_pseudo_legal_moves(board);
-        if moves.is_empty() { return -(MATE_SCORE - ply as i32); }
-        *nodes += moves.len() as u64;
+    if d <= 5 && pruning {
+        // Fast path: all d <= 5 use the O(1) incremental PSQT evaluator
+        // (material + family weight + zone bonus). No movegen needed —
+        // generating ~700 moves at every shallow leaf is the dominant cost
+        // of deep search. Reference: HaChu — incremental evaluation scales
+        // with the board perimeter, not the area.
+        *nodes += 1;
         return evaluate(board);
     }
 
@@ -594,158 +644,71 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         tt_probe(hash).map(|(_, mv)| mv).unwrap_or(0)
     } else { tt_move };
 
-    // ── GENERATE MOVES ────────────────────────────────────────
-    let moves = generate_pseudo_legal_moves(board);
-    if moves.is_empty() { return -(MATE_SCORE - ply as i32); }
-
-    // ── MOVE ORDERING ─────────────────────────────────────────
-    // Score each move: hash > MVV-LVA captures > killers > history > counter
-    let mut scored: Vec<(i32, usize, u32)> = Vec::with_capacity(moves.len());
-    for (i, m) in moves.iter().enumerate() {
-        let packed = m_pack(m);
-        let hist = history_score(m.from_sq as usize, m.to_sq as usize);
-        let cntr = counter_score(prev_move, packed);
-        let s = score_move(m, iid_move, hist, cntr, d);
-        scored.push((s, i, packed));
-    }
-
-    // Separate into tactical and quiet for beam search
-    let beam = if d <= 1 { 8 } else if d <= 2 { 6 } else if d <= 4 { 4 } else { 3 };
-    // ── REALIZATION PROBABILITY SEARCH (RPS) in internal nodes ──
-    // Only search the top-N most likely moves (ordered by captures, killers,
-    // history). This is the key technique from GEKISASHI (Tsuruoka et al.,
-    // 2002) that won the World Shogi Championship — it reduces the effective
-    // branching factor from ~700 to a small beam, making deeper search
-    // feasible. Reference: docx §4.1.
-    // RPS beam in internal nodes: very aggressive for deep nodes so the
-    // search can complete more plies within the time budget. Each node at
-    // depth >= 4 is extremely expensive (movegen ~700 moves), so searching
-    // only the top 2-3 moves lets us go deeper.
+    // ── STAGED MOVE GENERATION ────────────────────────────────
+    // Generate captures first (cheap, ~10-50 moves), search them. Only if
+    // no beta cutoff is found do we generate the full quiet move list
+    // (~700 moves). This avoids generating ~700 quiet moves at every node
+    // when a capture already causes a cutoff — the dominant cost of deep
+    // search. Reference: docx §3.2 Futility Pruning & §4.4 Quiescence.
     let rps_beam = if d <= 2 { 12 } else if d <= 4 { 6 } else { 3 };
-
-    // ── PARTIAL SELECTION (instead of full sort) ─────────────
-    // We only search the top `rps_beam` moves (plus a few for dynamic
-    // widening). A full sort of all ~700 moves is O(n log n) and wastes
-    // ~99% of the work since we never touch the tail. Instead, use
-    // select_nth_unstable to partition so the top-N are at the front —
-    // O(n) average, and the tail stays unsorted (we never read it).
-    // Reference: "Partial selection" — Chess Programming Wiki, Move
-    // Ordering (only the top moves need to be ordered).
-    let select_n = (rps_beam + 2).min(scored.len());
-    if select_n > 1 && scored.len() > select_n {
-        scored.select_nth_unstable_by(select_n - 1, |a, b| b.0.cmp(&a.0));
-    } else {
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    }
     let mut best: Option<Move> = None;
     let mut tt_flag: u8 = 2; // UPPERBOUND
     let init_alpha = alpha;
     let mut searched = false;
 
-    for (move_idx, &(order_score, idx, packed)) in scored.iter().enumerate() {
-        // RPS: stop searching after the top-N moves (unless we're in check
-        // or haven't found a move yet — then search a bit more).
+    // Stage 1: captures + promotions (tactical moves).
+    // Use the bitboard attack generator (O(attacked squares) for non-sliding
+    // pieces). If a special piece (hook/range-capture/lion) is present,
+    // fall back to the full capture generator.
+    let (cap_moves, cap_mode) = crate::attack::generate_captures_bb(board);
+    let cap_moves = if cap_mode == crate::attack::GenMode::NeedsFallback {
+        generate_pseudo_legal_captures(board)
+    } else {
+        cap_moves
+    };
+    let mut cap_scored: Vec<(i32, usize, u32)> = Vec::with_capacity(cap_moves.len());
+    for (i, m) in cap_moves.iter().enumerate() {
+        let packed = m_pack(m);
+        let hist = history_score(m.from_sq as usize, m.to_sq as usize);
+        let cntr = counter_score(prev_move, packed);
+        let s = score_move(m, iid_move, hist, cntr, d);
+        cap_scored.push((s, i, packed));
+    }
+    cap_scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+    for (move_idx, &(order_score, idx, packed)) in cap_scored.iter().enumerate() {
         if move_idx >= rps_beam && !in_check && searched {
             break;
         }
-        // Re-check the clock between sibling moves at this node. Without
-        // this, a parent node only learns the deadline passed when a
-        // recursive pvs() call returns early -- but it would then keep
-        // trying further sibling moves anyway, so the overshoot compounds
-        // at every level of the tree. This was causing multi-second
-        // overshoots past time_limit_ms even though the leaf-level check
-        // (nodes & 255) was firing correctly.
         if move_idx > 0 {
             if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
         }
-
-        // ── LATE MOVE PRUNING (LMP) ───────────────────────────
-        // Skip quiet moves beyond the beam at shallow depths
-        if pruning && d <= 2 && move_idx >= beam && order_score < 1_000_000
-            && alpha > -MATE_SCORE + 100
-        {
-            continue;
-        }
-
-        // Re-check deadline between sibling moves, not just on function entry.
-        // Without this, a child pvs() call can return early on deadline but
-        // this loop would keep launching more siblings (each re-entering pvs,
-        // incrementing nodes, but not necessarily hitting the next 256-node
-        // boundary soon) — the overshoot compounds across ply levels.
-        // Skip on move_idx==0 since we must search at least one move.
-        if move_idx > 0 {
-            if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
-        }
-
-        let m = &moves[idx];
-        // Check if this is a king move BEFORE applying (cheaper than after)
+        let m = &cap_moves[idx];
         let from_cell = board.cells[m.from_sq as usize];
         let is_king_move = pieces::is_royal(cell_piece(from_cell));
         board.apply_move(m);
-        // Pseudo-legal search (Stockfish technique): skip the expensive
-        // is_in_check() call for most moves. Only verify legality when:
-        // 1) The king itself moved (must not move into check)
-        // 2) We're already in check (must escape check)
-        // For all other moves, the search naturally avoids illegal positions
-        // because they produce terrible scores (king gets captured).
-        // This eliminates ~700 is_in_check calls per node at depth ≥ 3.
         if (is_king_move || in_check) && is_in_check(board) {
             board.undo_move();
             continue;
         }
         searched = true;
-
-        // ── SINGULAR EXTENSION ─────────────────────────────────
-        // If the TT move is clearly the principal move in a deep node,
-        // give it a small extension. Kept conservative to avoid exploding
-        // the tree on gigantic boards.
-        let singular_ext = pruning && d >= 6 && !in_check && tt_move != 0 && packed == tt_move && order_score < 1_000_000;
-
-        // ── LATE MOVE REDUCTION (LMR) ─────────────────────────
-        // Reduce depth for late quiet moves
-        let reduction = if pruning && move_idx >= 3 && d >= 3
-            && order_score < 1_000_000 && !in_check
-        {
-            let base = (move_idx / 3).min(3) as u32;
-            let depth_factor = (d / 3).min(2);
-            base + depth_factor
-        } else { 0 };
-        let mut new_d = d.saturating_sub(1 + reduction);
-        if singular_ext { new_d = new_d.saturating_add(1); }
-
-        // ── PVS / egaScout ────────────────────────────────────
-        // First move: full window search
-        // Subsequent moves: null-window search (egaScout)
-        let score;
-        if move_idx == 0 {
-            score = -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed);
-        } else if reduction > 0 {
-            // Null-window search with reduced depth
-            let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, pruning, packed);
-            if nw > alpha && nw < beta {
-                // Re-search with full depth (no reduction)
-                score = -pvs(board, d.saturating_sub(1), -beta, -alpha,
-                            nodes, deadline, ply + 1, pruning, packed);
-            } else { score = nw; }
+        let new_d = d.saturating_sub(1);
+        let score = if move_idx == 0 {
+            -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed)
         } else {
-            // Null-window search (egaScout)
             let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, pruning, packed);
             if nw > alpha && nw < beta {
-                // Re-search with full window
-                score = -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed);
-            } else { score = nw; }
-        }
-
+                -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed)
+            } else { nw }
+        };
         board.undo_move();
-
         if score > alpha {
             alpha = score;
-            tt_flag = 0; // EXACT
+            tt_flag = 0;
             best = Some(m.clone());
         }
         if alpha >= beta {
-            tt_flag = 1; // LOWERBOUND
-            // Store killer and history for quiet moves that cause beta cutoffs
+            tt_flag = 1;
             if order_score < 1_000_000 {
                 killer_store(d, packed);
                 history_store(m.from_sq as usize, m.to_sq as usize, d);
@@ -755,27 +718,95 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         }
     }
 
-    // ── DYNAMIC WIDENING ──────────────────────────────────────
-    // If no move raised alpha (fail-low), search more moves.
-    // Only the first `select_n` entries are sorted (top-N); the tail is
-    // unsorted after select_nth_unstable, so we only widen within the
-    // sorted prefix.
-    if !searched || (alpha <= init_alpha && !best.is_some()) {
-        let widen_end = scored.len().min(select_n);
-        for &(_score, idx, packed) in &scored[beam..widen_end] {
-            if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
+    // Stage 2: quiet moves (only if no beta cutoff from captures).
+    // For deep nodes (d >= 4), skip quiet moves entirely unless in check —
+    // this is the selective-search essence of RPS (docx §4.1): at depth,
+    // only captures + the TT move matter; generating all ~700 quiet moves
+    // at every deep node is the dominant cost. This makes deep nodes only
+    // generate ~10-50 captures instead of ~700 moves.
+    if alpha < beta && (d < 4 || in_check) {
+        let moves = generate_pseudo_legal_moves(board);
+        if moves.is_empty() { return -(MATE_SCORE - ply as i32); }
+        let mut scored: Vec<(i32, usize, u32)> = Vec::with_capacity(moves.len());
+        for (i, m) in moves.iter().enumerate() {
+            let packed = m_pack(m);
+            let hist = history_score(m.from_sq as usize, m.to_sq as usize);
+            let cntr = counter_score(prev_move, packed);
+            let s = score_move(m, iid_move, hist, cntr, d);
+            scored.push((s, i, packed));
+        }
+        let beam = if d <= 1 { 8 } else if d <= 2 { 6 } else if d <= 4 { 4 } else { 3 };
+        let select_n = (rps_beam + 2).min(scored.len());
+        if select_n > 1 && scored.len() > select_n {
+            scored.select_nth_unstable_by(select_n - 1, |a, b| b.0.cmp(&a.0));
+        } else {
+            scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        }
+
+        for (move_idx, &(order_score, idx, packed)) in scored.iter().enumerate() {
+            if move_idx >= rps_beam && !in_check && searched {
+                break;
+            }
+            if move_idx > 0 {
+                if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
+            }
+            if pruning && d <= 2 && move_idx >= beam && order_score < 1_000_000
+                && alpha > -MATE_SCORE + 100
+            {
+                continue;
+            }
+            if move_idx > 0 {
+                if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
+            }
             let m = &moves[idx];
+            let from_cell = board.cells[m.from_sq as usize];
+            let is_king_move = pieces::is_royal(cell_piece(from_cell));
             board.apply_move(m);
-            if is_in_check(board) { board.undo_move(); continue; }
-            let nw = -pvs(board, d.saturating_sub(2), -alpha - 1, -alpha,
-                         nodes, deadline, ply + 1, pruning, packed);
-            if nw > alpha {
-                let score = -pvs(board, d.saturating_sub(1), -beta, -alpha,
+            if (is_king_move || in_check) && is_in_check(board) {
+                board.undo_move();
+                continue;
+            }
+            searched = true;
+            let singular_ext = pruning && d >= 6 && !in_check && tt_move != 0 && packed == tt_move && order_score < 1_000_000;
+            let reduction = if pruning && move_idx >= 3 && d >= 3
+                && order_score < 1_000_000 && !in_check
+            {
+                let base = (move_idx / 3).min(3) as u32;
+                let depth_factor = (d / 3).min(2);
+                base + depth_factor
+            } else { 0 };
+            let mut new_d = d.saturating_sub(1 + reduction);
+            if singular_ext { new_d = new_d.saturating_add(1); }
+            let score;
+            if move_idx == 0 {
+                score = -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed);
+            } else if reduction > 0 {
+                let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, pruning, packed);
+                if nw > alpha && nw < beta {
+                    score = -pvs(board, d.saturating_sub(1), -beta, -alpha,
                                 nodes, deadline, ply + 1, pruning, packed);
-                if score > alpha { alpha = score; tt_flag = 0; best = Some(m.clone()); }
+                } else { score = nw; }
+            } else {
+                let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, pruning, packed);
+                if nw > alpha && nw < beta {
+                    score = -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed);
+                } else { score = nw; }
             }
             board.undo_move();
-            if alpha >= beta { tt_flag = 1; break; }
+            if score > alpha {
+                alpha = score;
+                tt_flag = 0;
+                best = Some(m.clone());
+            }
+            if alpha >= beta {
+                tt_flag = 1;
+                if order_score < 1_000_000 {
+                    killer_store(d, packed);
+                    history_store(m.from_sq as usize, m.to_sq as usize, d);
+                }
+                if prev_move != 0 { counter_store(prev_move, packed); }
+                break;
+            }
         }
     }
 

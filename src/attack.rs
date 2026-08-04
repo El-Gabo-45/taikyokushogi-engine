@@ -124,6 +124,99 @@ pub fn templates() -> &'static [[Template; 2]; 512] {
     })
 }
 
+/// Generate pseudo-legal captures using the flat templates (memory-safe,
+/// no huge precomputed bitboard table). For each piece, walks its jumps
+/// (checking opponent occupancy) and slides (ray walk with blocking).
+/// Returns `NeedsFallback` if a special piece (hook, range-capture, lion
+/// mid-capture) is present — caller must use the full
+/// `movegen::generate_pseudo_legal_captures`.
+pub fn generate_captures_bb(board: &Board) -> (Vec<crate::types::Move>, GenMode) {
+    let color = board.side_to_move;
+    let c = color as usize;
+    let t = templates();
+    let rt = ray_table();
+    let mut moves = Vec::with_capacity(64);
+    let mut mode = GenMode::AllFast;
+
+    for i in 0..board.piece_list_len[c] {
+        let sq = board.piece_list[c][i] as usize;
+        if sq == INVALID_SQ as usize { continue; }
+        let cell = board.cells[sq];
+        if cell == EMPTY_CELL { continue; }
+        let pt = cell_piece(cell);
+        let tmpl = &t[(pt as usize).min(511)][color as usize];
+
+        if !tmpl.valid {
+            mode = GenMode::NeedsFallback;
+            continue;
+        }
+
+        let sq_r = sq_row(sq) as i32;
+        let sq_c = sq_col(sq) as i32;
+
+        // Jumps/steps/area: only capture if target is an enemy piece.
+        for j in 0..tmpl.n_jumps as usize {
+            let (dr, dc) = tmpl.jumps[j];
+            let nr = sq_r + dr as i32;
+            let nc = sq_c + dc as i32;
+            if nr < 0 || nr >= BOARD_SIZE as i32 || nc < 0 || nc >= BOARD_SIZE as i32 { continue; }
+            let nsq = (nr as usize) * BOARD_SIZE + (nc as usize);
+            let target = board.cells[nsq];
+            if target != EMPTY_CELL && cell_color(target) != color {
+                push_move(&mut moves, sq as u16, nsq as u16, pt, color, target);
+            }
+        }
+
+        // Sliders: walk rays (occupancy-dependent blocking).
+        for j in 0..tmpl.n_slides as usize {
+            let (dir, max_range) = tmpl.slides[j];
+            walk_ray_captures(board, rt, sq, pt, color, dir as usize, max_range, &mut moves);
+        }
+
+        // Igui (capture in place).
+        if tmpl.has_igui {
+            for d in 0..NUM_DIRS {
+                if let Some(nsq) = step_sq(sq, d, color) {
+                    let target = board.cells[nsq];
+                    if target != EMPTY_CELL && cell_color(target) != color {
+                        push_move_igui(&mut moves, sq as u16, pt, color, target);
+                    }
+                }
+            }
+        }
+    }
+
+    (moves, mode)
+}
+
+#[inline]
+fn can_promote(pt: u16) -> bool {
+    pieces::promotes_to(pt).is_some()
+}
+
+#[inline]
+fn walk_ray_captures(board: &Board, rt: &RayTable,
+                     sq: usize, pt: u16, color: u8, dir: usize, max_range: u8,
+                     moves: &mut Vec<crate::types::Move>) {
+    let ray = rt.ray_for_color(sq, dir, color);
+    let limit = if max_range == 0 { ray.len() } else { (max_range as usize).min(ray.len()) };
+    for j in 0..limit {
+        let rsq = ray[j] as usize;
+        let target = board.cells[rsq];
+        if target == EMPTY_CELL {
+            // Non-capturing promotion: only include if entering promo zone.
+            if in_promo_zone(rsq, color) && can_promote(pt) {
+                push_move(moves, sq as u16, rsq as u16, pt, color, EMPTY_CELL);
+            }
+        } else if cell_color(target) != color {
+            push_move(moves, sq as u16, rsq as u16, pt, color, target);
+            break;
+        } else {
+            break;
+        }
+    }
+}
+
 /// Fast path for a single non-special piece. Generates jump/step/slide/area/
 /// igui moves into `moves` using the flat template `tmpl`.
 pub fn fast_piece(
