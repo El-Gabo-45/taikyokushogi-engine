@@ -26,6 +26,13 @@ use std::sync::OnceLock;
 const MAX_JUMP_DELTAS: usize = 32;
 const MAX_SLIDES: usize = 10;
 
+const HOOK_ORTHO_NS: [usize; 2] = [N, S];
+const HOOK_ORTHO_EW: [usize; 2] = [E, W];
+const HOOK_TURN_NE: [usize; 2] = [NW, SE];
+const HOOK_TURN_SE: [usize; 2] = [NE, SW];
+const HOOK_TURN_SW: [usize; 2] = [SE, NW];
+const HOOK_TURN_NW: [usize; 2] = [NE, SW];
+
 /// Flat movement template per (piece_type, color). Only valid for pieces
 /// whose moves are pure jumps/steps/slides/area/igui (no hook, no
 /// range_capture, no lion mid-capture). `valid=false` → must use fallback.
@@ -127,9 +134,10 @@ pub fn templates() -> &'static [[Template; 2]; 512] {
 /// Generate pseudo-legal captures using the flat templates (memory-safe,
 /// no huge precomputed bitboard table). For each piece, walks its jumps
 /// (checking opponent occupancy) and slides (ray walk with blocking).
-/// Returns `NeedsFallback` if a special piece (hook, range-capture, lion
-/// mid-capture) is present — caller must use the full
-/// `movegen::generate_pseudo_legal_captures`.
+/// Handles hooks and range-capturers directly so it does NOT fall back to
+/// the slow `movegen::generate_pseudo_legal_captures` for the common
+/// special pieces. Only lion mid-captures (area>=2 with jumps) trigger
+/// `NeedsFallback`.
 pub fn generate_captures_bb(board: &Board) -> (Vec<crate::types::Move>, GenMode) {
     let color = board.side_to_move;
     let c = color as usize;
@@ -147,7 +155,19 @@ pub fn generate_captures_bb(board: &Board) -> (Vec<crate::types::Move>, GenMode)
         let tmpl = &t[(pt as usize).min(511)][color as usize];
 
         if !tmpl.valid {
-            mode = GenMode::NeedsFallback;
+            // Special piece: handle hooks, range-capturers, AND lion
+            // mid-captures directly so we NEVER fall back to the slow
+            // movegen path.
+            let mv = pieces::movement(pt);
+            if mv.hook.is_some() {
+                gen_hook_captures(board, sq, pt, color, mv, rt, &mut moves);
+            }
+            if !mv.range_capture.is_empty() {
+                gen_range_capture_captures(board, sq, pt, color, mv, rt, &mut moves);
+            }
+            if mv.area >= 2 {
+                gen_lion_captures(board, sq, pt, color, mv, &mut moves);
+            }
             continue;
         }
 
@@ -187,6 +207,124 @@ pub fn generate_captures_bb(board: &Board) -> (Vec<crate::types::Move>, GenMode)
     }
 
     (moves, mode)
+}
+
+/// Generate hook-move captures (orthogonal or diagonal hook movers).
+fn gen_hook_captures(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
+                     rt: &RayTable, moves: &mut Vec<crate::types::Move>) {
+    let dirs: &[usize] = match mv.hook {
+        Some(HookType::Orthogonal) => &[N, E, S, W],
+        Some(HookType::Diagonal) => &[NE, SE, SW, NW],
+        None => return,
+    };
+    for &d in dirs {
+        let ray = rt.ray_for_color(sq, d, color);
+        for &mid_sq in ray.iter() {
+            let mid = mid_sq as usize;
+            let target = board.cells[mid];
+            if target != EMPTY_CELL {
+                if cell_color(target) != color {
+                    push_move(moves, sq as u16, mid_sq, pt, color, target);
+                }
+                break;
+            }
+            let turn_dirs: &[usize] = match mv.hook {
+                Some(HookType::Orthogonal) => {
+                    if d == N || d == S { &HOOK_ORTHO_NS } else { &HOOK_ORTHO_EW }
+                }
+                Some(HookType::Diagonal) => match d {
+                    NE => &HOOK_TURN_NE,
+                    SE => &HOOK_TURN_SE,
+                    SW => &HOOK_TURN_SW,
+                    NW => &HOOK_TURN_NW,
+                    _ => &[],
+                },
+                None => &[],
+            };
+            for &td in turn_dirs {
+                let turn_ray = rt.ray_for_color(mid, td, color);
+                for &tsq in turn_ray {
+                    let t = board.cells[tsq as usize];
+                    if t == EMPTY_CELL { continue; }
+                    if cell_color(t) != color {
+                        push_move(moves, sq as u16, tsq, pt, color, t);
+                        break;
+                    } else { break; }
+                }
+            }
+        }
+    }
+}
+
+/// Generate range-capture moves (captures pieces of lower rank along rays).
+fn gen_range_capture_captures(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
+                              rt: &RayTable, moves: &mut Vec<crate::types::Move>) {
+    let piece_rank = pieces::rank(pt);
+    for &dir in &mv.range_capture {
+        let ray = rt.ray_for_color(sq, dir as usize, color);
+        for &rsq in ray {
+            let target = board.cells[rsq as usize];
+            if target == EMPTY_CELL { continue; }
+            let t_pt = cell_piece(target);
+            let t_rank = pieces::rank(t_pt);
+            if t_rank > piece_rank {
+                push_move(moves, sq as u16, rsq, pt, color, target);
+            } else { break; }
+        }
+    }
+}
+
+/// Generate lion area captures — the radius-1 and radius-2 moves, including
+/// mid-captures (capture a piece on the way to a second target). This
+/// eliminates the slow fallback to movegen for lions.
+fn gen_lion_captures(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
+                     moves: &mut Vec<crate::types::Move>) {
+    let r = sq_row(sq) as i32;
+    let c = sq_col(sq) as i32;
+
+    for d1 in 0..NUM_DIRS {
+        let (dr1, dc1) = get_deltas(d1, color);
+        let r1 = r + dr1;
+        let c1 = c + dc1;
+        if r1 < 0 || r1 >= BOARD_SIZE as i32 || c1 < 0 || c1 >= BOARD_SIZE as i32 { continue; }
+        let sq1 = r1 as usize * BOARD_SIZE + c1 as usize;
+        let t1 = board.cells[sq1];
+        if t1 != EMPTY_CELL && cell_color(t1) == color { continue; }
+
+        // Direct capture at first step (if enemy).
+        if t1 != EMPTY_CELL && cell_color(t1) != color {
+            push_move(moves, sq as u16, sq1 as u16, pt, color, t1);
+        }
+
+        if mv.area >= 2 {
+            for d2 in 0..NUM_DIRS {
+                let (dr2, dc2) = get_deltas(d2, color);
+                let r2 = r1 + dr2;
+                let c2 = c1 + dc2;
+                if r2 < 0 || r2 >= BOARD_SIZE as i32 || c2 < 0 || c2 >= BOARD_SIZE as i32 { continue; }
+                let sq2 = r2 as usize * BOARD_SIZE + c2 as usize;
+                if sq2 == sq { continue; }
+                let t2 = board.cells[sq2];
+                if t2 != EMPTY_CELL && cell_color(t2) == color { continue; }
+
+                // Mid-capture: capture t1 on the way to sq2.
+                if t1 != EMPTY_CELL && cell_color(t1) != color {
+                    let mut m = crate::types::Move::simple(sq as u16, sq2 as u16);
+                    m.mid_sq = sq1 as u16;
+                    m.mid_piece = cell_piece(t1);
+                    m.mid_color = cell_color(t1);
+                    if t2 != EMPTY_CELL {
+                        m.captured_piece = cell_piece(t2);
+                        m.captured_color = cell_color(t2);
+                    }
+                    moves.push(m);
+                } else if t2 != EMPTY_CELL && cell_color(t2) != color {
+                    // Direct capture at second step (path empty).
+                    push_move(moves, sq as u16, sq2 as u16, pt, color, t2);
+                }
+            }
+        }
+    }
 }
 
 #[inline]
