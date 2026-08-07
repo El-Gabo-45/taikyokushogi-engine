@@ -284,12 +284,36 @@ fn filter_legal_moves(board: &Board, mut moves: Vec<Move>) -> Vec<Move> {
     let mut legal_moves = Vec::with_capacity(moves.len());
     let mut board_copy = board.clone_without_history();
 
-    for m in moves.drain(..) {
-        board_copy.apply_move(&m);
-        if !is_in_check(&board_copy) {
-            legal_moves.push(m);
+    #[cfg(debug_assertions)]
+    {
+        for (i, m) in moves.drain(..).enumerate() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let undo = board_copy.apply_move_with_undo(&m);
+                let legal = !is_in_check(&board_copy);
+                board_copy.undo_move_with_info(undo);
+                legal
+            }));
+            match result {
+                Ok(true) => legal_moves.push(m),
+                Ok(false) => {},
+                Err(_) => {
+                    eprintln!("PANIC applying move #{}: {:?}", i, m);
+                    eprintln!("board_copy side_to_move={} piece_counts={:?} piece_list_len={:?}", board_copy.side_to_move, board_copy.piece_count, board_copy.piece_list_len);
+                    panic!("move application panic for debug");
+                }
+            }
         }
-        board_copy.undo_move();
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        for m in moves.drain(..) {
+            let undo = board_copy.apply_move_with_undo(&m);
+            if !is_in_check(&board_copy) {
+                legal_moves.push(m);
+            }
+            board_copy.undo_move_with_info(undo);
+        }
     }
 
     legal_moves
@@ -756,6 +780,9 @@ fn gen_range_capture(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
                 }
                 moves.push(m);
             } else {
+                if cell_color(target) == color {
+                    break;
+                }
                 let t_pt = cell_piece(target);
                 let t_rank = pieces::rank(t_pt);
                 if t_rank > piece_rank {

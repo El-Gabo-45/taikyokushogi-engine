@@ -199,13 +199,12 @@ fn is_tactical(m: &Move) -> bool {
 // Priority: 1) Hash move (TT)  2) MVV-LVA captures  3) Killers  4) History  5) Counter
 
 // ── Move ordering ───────────────────────────────────────────────
-fn score_move(m: &Move, tt_move: u32, hist: i32, cntr: i32, depth: u32) -> i32 {
+fn score_move(m: &Move, tt_move: u32, hist: i32, cntr: i32, depth: u32, vals: &[i32; 512]) -> i32 {
     let packed = m_pack(m);
     // 1) Hash move (from TT)
     if packed == tt_move { return 2_000_000; }
     // 2) Captures: MVV-LVA
     if is_tactical(m) {
-        let vals = piece_vals();
         let mut score = 1_000_000;
         if m.captured_piece != 0 { score += vals[m.captured_piece as usize] * 100; }
         if m.mid_piece != 0 { score += vals[m.mid_piece as usize] * 100; }
@@ -223,6 +222,24 @@ fn score_move(m: &Move, tt_move: u32, hist: i32, cntr: i32, depth: u32) -> i32 {
     hist + cntr
 }
 
+fn sort_top_moves(scored: &mut Vec<(i32, usize)>, top_n: usize) {
+    if scored.len() <= top_n {
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        return;
+    }
+    scored.select_nth_unstable_by(top_n - 1, |a, b| b.0.cmp(&a.0));
+    scored[..top_n].sort_unstable_by(|a, b| b.0.cmp(&a.0));
+}
+
+fn sort_top_moves_triplet(scored: &mut Vec<(i32, usize, u32)>, top_n: usize) {
+    if scored.len() <= top_n {
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        return;
+    }
+    scored.select_nth_unstable_by(top_n - 1, |a, b| b.0.cmp(&a.0));
+    scored[..top_n].sort_unstable_by(|a, b| b.0.cmp(&a.0));
+}
+
 // ── Root search helpers ──────────────────────────────────────────
 // Aspiration-window iterative deepening around the previous iteration's
 // score reduces expensive root re-searches when the score is stable.
@@ -235,7 +252,7 @@ fn search_root_window(
     root_beta: i32,
 ) -> SearchResult {
     let start = Instant::now();
-    piece_vals();
+    let values = piece_vals();
 
     if depth == 0 {
         return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
@@ -266,15 +283,13 @@ fn search_root_window(
             if m.promotion {
                 let pt = cell_piece(board.cells[m.from_sq as usize]);
                 if let Some(p) = pieces::promotes_to(pt) {
-                    let v = piece_vals();
-                    delta += sign * (v[p as usize] - v[pt as usize]);
+                    delta += sign * (values[p as usize] - values[pt as usize]);
                 }
             }
-            let v = piece_vals();
-            if m.captured_piece != 0 { delta += sign * v[m.captured_piece as usize]; }
-            if m.mid_piece != 0 { delta += sign * v[m.mid_piece as usize]; }
+            if m.captured_piece != 0 { delta += sign * values[m.captured_piece as usize]; }
+            if m.mid_piece != 0 { delta += sign * values[m.mid_piece as usize]; }
             if let Some(ref caps) = m.range_caps {
-                for &(_, pt, _) in caps.iter() { delta += sign * v[pt as usize]; }
+                for &(_, pt, _) in caps.iter() { delta += sign * values[pt as usize]; }
             }
             let s = -(base_mat + delta);
             if s > best_score { best_score = s; best_move = Some(m.clone()); }
@@ -303,11 +318,12 @@ fn search_root_window(
         for (i, m) in moves.iter().enumerate() {
             let packed = m_pack(m);
             let hist = history_score(m.from_sq as usize, m.to_sq as usize);
-            let mut s = score_move(m, root_tt_move, hist, 0, depth);
+            let mut s = score_move(m, root_tt_move, hist, 0, depth, values);
             if root_hint == Some(packed) { s += 3_000_000; }
             scored.push((s, i));
         }
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let top_n = scored.len();
+        sort_top_moves(&mut scored, top_n);
         for rank in 0..scored.len() {
             let idx = scored[rank].1;
             let m = &moves[idx];
@@ -349,11 +365,11 @@ fn search_root_window(
     for (i, m) in cap_moves.iter().enumerate() {
         let packed = m_pack(m);
         let hist = history_score(m.from_sq as usize, m.to_sq as usize);
-        let mut s = score_move(m, root_tt_move, hist, 0, depth);
+        let mut s = score_move(m, root_tt_move, hist, 0, depth, values);
         if root_hint == Some(packed) { s += 3_000_000; }
         cap_scored.push((s, i));
     }
-    cap_scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    sort_top_moves(&mut cap_scored, max_moves);
 
     for rank in 0..cap_scored.len().min(max_moves) {
         if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
@@ -398,11 +414,11 @@ fn search_root_window(
         for (i, m) in moves.iter().enumerate() {
             let packed = m_pack(m);
             let hist = history_score(m.from_sq as usize, m.to_sq as usize);
-            let mut s = score_move(m, root_tt_move, hist, 0, depth);
+            let mut s = score_move(m, root_tt_move, hist, 0, depth, values);
             if root_hint == Some(packed) { s += 3_000_000; }
             scored.push((s, i));
         }
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        sort_top_moves(&mut scored, max_moves);
         for rank in 0..scored.len().min(max_moves) {
             if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
             let idx = scored[rank].1;
@@ -451,6 +467,7 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
     } else { None };
 
     TT_GEN.fetch_add(1, Ordering::Relaxed);
+    board.reserve_history(depth as usize);
     piece_vals();
     let mut best_result = SearchResult { best_move: None, score: evaluate(board), nodes: 0, time_ms: 0 };
     let mut total_nodes: u64 = 0;
@@ -600,6 +617,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // of table lookups + the king-safety term). Use it at every node —
     // no need for the cheaper-but-cruder material-only approximation.
     let static_eval = evaluate(board);
+    let values = piece_vals();
 
     // ── RAZORING (depth ≤ 2) ──────────────────────────────────
     // If static_eval + huge_margin ≤ alpha, prune the node entirely
@@ -685,10 +703,10 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         let packed = m_pack(m);
         let hist = history_score(m.from_sq as usize, m.to_sq as usize);
         let cntr = counter_score(prev_move, packed);
-        let s = score_move(m, iid_move, hist, cntr, d);
+        let s = score_move(m, iid_move, hist, cntr, d, values);
         cap_scored.push((s, i, packed));
     }
-    cap_scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    sort_top_moves_triplet(&mut cap_scored, rps_beam);
 
     for (move_idx, &(order_score, idx, packed)) in cap_scored.iter().enumerate() {
         if move_idx >= rps_beam && !in_check && searched {
@@ -739,25 +757,23 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // at every deep node is the dominant cost. This makes deep nodes only
     // generate ~10-50 captures instead of ~700 moves.
     if alpha < beta {
-        let moves = generate_pseudo_legal_moves(board);
-        if moves.is_empty() { return -(MATE_SCORE - ply as i32); }
-        let mut scored: Vec<(i32, usize, u32)> = Vec::with_capacity(moves.len());
-        for (i, m) in moves.iter().enumerate() {
-            let packed = m_pack(m);
-            let hist = history_score(m.from_sq as usize, m.to_sq as usize);
-            let cntr = counter_score(prev_move, packed);
-            let s = score_move(m, iid_move, hist, cntr, d);
-            scored.push((s, i, packed));
-        }
-        let beam = if d <= 1 { 24 } else if d <= 2 { 18 } else if d <= 4 { 12 } else { 8 };
-        let select_n = (rps_beam + 2).min(scored.len());
-        if select_n > 1 && scored.len() > select_n {
-            scored.select_nth_unstable_by(select_n - 1, |a, b| b.0.cmp(&a.0));
-        } else {
-            scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        }
+        let deep_skip_quiets = d >= 4 && !in_check && searched;
+        if !deep_skip_quiets {
+            let moves = generate_pseudo_legal_moves(board);
+            if moves.is_empty() { return -(MATE_SCORE - ply as i32); }
+            let mut scored: Vec<(i32, usize, u32)> = Vec::with_capacity(moves.len());
+            for (i, m) in moves.iter().enumerate() {
+                let packed = m_pack(m);
+                let hist = history_score(m.from_sq as usize, m.to_sq as usize);
+                let cntr = counter_score(prev_move, packed);
+                let s = score_move(m, iid_move, hist, cntr, d, values);
+                scored.push((s, i, packed));
+            }
+            let beam = if d <= 1 { 24 } else if d <= 2 { 18 } else if d <= 4 { 12 } else { 8 };
+            let select_n = (rps_beam + 2).min(scored.len());
+            sort_top_moves_triplet(&mut scored, select_n);
 
-        for (move_idx, &(order_score, idx, packed)) in scored.iter().enumerate() {
+            for (move_idx, &(order_score, idx, packed)) in scored.iter().enumerate() {
             if move_idx >= rps_beam && !in_check && searched {
                 break;
             }
@@ -823,6 +839,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             }
         }
     }
+}
 
     // ── TT STORE ──────────────────────────────────────────────
     if let Some(bm) = &best {
