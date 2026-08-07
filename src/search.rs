@@ -387,10 +387,9 @@ fn search_root_window(
         if best_score >= root_beta { break; }
     }
 
-    // Stage 2: quiet moves (only if no beta cutoff from captures).
-    // The fast is_in_check + capture generation optimizations make full
-    // quiet search at all root depths feasible within the time budget.
-    if best_score < root_beta {
+    // Stage 2: quiet moves (only if no beta cutoff from captures AND not
+    // too deep). For depth >= 4, use the RPS beam to limit quiet moves.
+    if best_score < root_beta && depth <= 3 {
         let moves = generate_pseudo_legal_moves(board);
         if moves.is_empty() {
             return SearchResult { best_move, score: best_score, nodes, time_ms: start.elapsed().as_millis() as u64 };

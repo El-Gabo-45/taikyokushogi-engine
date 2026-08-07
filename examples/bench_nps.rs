@@ -109,7 +109,7 @@ fn main() {
 
     for depth in [1u32, 2, 3, 4, 5, 6].iter() {
         let mut board = Board::initial();
-        let limit_ms = if *depth <= 2 { 500 } else if *depth <= 4 { 1000 } else { 1500 };
+        let limit_ms = if *depth <= 2 { 500 } else if *depth <= 4 { 10000 } else { 30000 };
         let result = board.search(*depth, limit_ms);
         let nps = if result.time_ms > 0 {
             result.nodes as f64 / (result.time_ms as f64 / 1000.0)
