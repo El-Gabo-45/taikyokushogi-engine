@@ -84,28 +84,17 @@ pub fn evaluate(board: &Board) -> i32 {
 }
 
 /// Simple king safety: penalize if the king has no friendly pieces nearby.
+/// Uses the precomputed threat-zone bitboard for O(1) defender counting.
 fn king_safety(board: &Board, color: u8) -> i32 {
     let king_sq = board.king_square(color);
     if king_sq == INVALID_SQ || (king_sq as usize) >= NUM_SQUARES { return 0; }
 
-    let kr = (king_sq as usize) / BOARD_SIZE;
-    let kc = (king_sq as usize) % BOARD_SIZE;
-
-    let mut defenders = 0;
-    for dr in -2i32..=2 {
-        for dc in -2i32..=2 {
-            if dr == 0 && dc == 0 { continue; }
-            let r = kr as i32 + dr;
-            let c = kc as i32 + dc;
-            if r < 0 || r >= BOARD_SIZE as i32 || c < 0 || c >= BOARD_SIZE as i32 { continue; }
-            let sq = (r as usize) * BOARD_SIZE + (c as usize);
-            if sq >= NUM_SQUARES { continue; }
-            let cell = board.cells[sq];
-            if cell != EMPTY_CELL && cell_color(cell) == color {
-                defenders += 1;
-            }
-        }
-    }
+    // Use the precomputed 5x5 threat zone around the king and intersect
+    // with friendly occupancy — O(1) bitboard AND + popcount instead of
+    // a 5x5 loop with bounds checks.
+    let zone = crate::bitboard::threat_zone_table().zone(king_sq as usize);
+    let friendly = board.occupancy[color as usize].and_new(zone);
+    let defenders = friendly.count() as i32;
 
     defenders * 5
 }

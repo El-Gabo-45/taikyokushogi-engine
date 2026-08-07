@@ -363,13 +363,55 @@ fn piece_gives_check(
         if cell == EMPTY_CELL { return false; }
         
         let pt = cell_piece(cell);
-        let mv = pieces::movement(pt);
         let psq_row = sq / BOARD_SIZE;
         let psq_col = sq % BOARD_SIZE;
         
         let dr = if psq_row > king_row { psq_row - king_row } else { king_row - psq_row };
         let dc = if psq_col > king_col { psq_col - king_col } else { king_col - psq_col };
         let max_dist = dr.max(dc);
+
+        // Fast path: use flat attack templates for simple pieces (no heap reads).
+        let t = crate::attack::templates();
+        let tmpl = &t[(pt as usize).min(511)][opp as usize];
+        if tmpl.valid {
+            // Jumps/steps/area: check if king is a jump destination.
+            let sq_r = psq_row as i32;
+            let sq_c = psq_col as i32;
+            for j in 0..tmpl.n_jumps as usize {
+                let (jdr, jdc) = tmpl.jumps[j];
+                let nr = sq_r + jdr as i32;
+                let nc = sq_c + jdc as i32;
+                if nr < 0 || nr >= BOARD_SIZE as i32 || nc < 0 || nc >= BOARD_SIZE as i32 { continue; }
+                let nsq = (nr as usize) * BOARD_SIZE + (nc as usize);
+                if nsq == king_sq_usize { return true; }
+            }
+            // Slides: walk rays, check if king is reachable.
+            for j in 0..tmpl.n_slides as usize {
+                let (dir, max_range) = tmpl.slides[j];
+                let ray = rt.ray_for_color(sq, dir as usize, opp);
+                let limit = if max_range == 0 { ray.len() } else { (max_range as usize).min(ray.len()) };
+                for k in 0..limit {
+                    let rsq = ray[k] as usize;
+                    if rsq == king_sq_usize { return true; }
+                    if board.cells[rsq] != EMPTY_CELL { break; }
+                }
+            }
+            // Igui: capture in place.
+            if tmpl.has_igui && max_dist <= 1 {
+                for d in 0..NUM_DIRS {
+                    if let Some(nsq) = step_sq(sq, d, opp) {
+                        let target = board.cells[nsq];
+                        if target != EMPTY_CELL && cell_color(target) != opp {
+                            if nsq == king_sq_usize { return true; }
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        // Fallback: special pieces need the original movement logic.
+        let mv = pieces::movement(pt);
         
         // Jumps — use precomputed JUMP_TABLE for O(1) destination lookup
         if !mv.jumps.is_empty() {

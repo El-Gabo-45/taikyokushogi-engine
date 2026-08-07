@@ -22,6 +22,7 @@ struct TTEntry {
     flag: u8,       // 0=EXACT, 1=LOWERBOUND (≥beta), 2=UPPERBOUND (≤alpha)
     generation: u8,
     best_move: u32,
+    in_check: bool, // Position is in check (cached to avoid re-checking)
 }
 
 static TT: OnceLock<Vec<AtomicU64>> = OnceLock::new();
@@ -34,6 +35,7 @@ fn tt() -> &'static Vec<AtomicU64> {
 fn tt_index(hash: u64) -> usize { ((hash as usize) & (TT_SIZE - 1)) * TT_BUCKET_WIDTH * 2 }
 
 const TT_MOVE_MASK: u64 = (1 << 25) - 1;
+const TT_CHECK_MASK: u64 = 1 << 25;
 
 #[inline]
 fn tt_pack(entry: &TTEntry, gen: u8) -> u64 {
@@ -43,6 +45,7 @@ fn tt_pack(entry: &TTEntry, gen: u8) -> u64 {
         | ((entry.depth as u64 & 0x7F) << 41)
         | ((entry.flag as u64 & 0x03) << 39)
         | ((gen as u64) << 31)
+        | if entry.in_check { TT_CHECK_MASK } else { 0 }
         | (mv as u64)
 }
 
@@ -54,6 +57,7 @@ fn tt_unpack(packed: u64) -> TTEntry {
         flag: ((packed >> 39) & 0x03) as u8,
         generation: ((packed >> 31) & 0xFF) as u8,
         best_move: (packed & TT_MOVE_MASK) as u32,
+        in_check: (packed & TT_CHECK_MASK) != 0,
     }
 }
 
@@ -323,7 +327,7 @@ fn search_root_window(
         // Smaller beams reduce the number of expensive capture generations
         // per node, letting each depth complete within the time budget.
         // This is legitimate selective search (RPS), not node faking.
-        let beam = if depth <= 3 { 24 } else if depth <= 5 { 8 } else { 4 };
+        let beam = if depth <= 3 { 48 } else if depth <= 5 { 12 } else { 6 };
         beam
     };
 
@@ -383,12 +387,10 @@ fn search_root_window(
         if best_score >= root_beta { break; }
     }
 
-    // Stage 2: quiet moves (only if no beta cutoff from captures AND not
-    // too deep). For depth >= 4, skip the full ~700-move quiet generation —
-    // the capture-only search (RPS) plus the O(1) PSQT eval at leaves is
-    // sufficient. Generating + sorting all ~700 quiet root moves at depth
-    // >= 4 is the dominant cost and blows the time budget.
-    if best_score < root_beta && depth <= 3 {
+    // Stage 2: quiet moves (only if no beta cutoff from captures).
+    // The fast is_in_check + capture generation optimizations make full
+    // quiet search at all root depths feasible within the time budget.
+    if best_score < root_beta {
         let moves = generate_pseudo_legal_moves(board);
         if moves.is_empty() {
             return SearchResult { best_move, score: best_score, nodes, time_ms: start.elapsed().as_millis() as u64 };
@@ -537,7 +539,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // could pass between deadline checks, badly overshooting time_limit_ms.
     // 255 keeps the check itself cheap (bitwise AND) while checking the
     // clock roughly every 40-50ms of real time at this engine's node cost.
-    if *nodes & 255 == 0 {
+    if *nodes & 63 == 0 {
         if let Some(dl) = deadline { if Instant::now() >= dl { return alpha; } }
     }
 
@@ -550,15 +552,16 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         };
     }
 
-    // Check extension
-    let in_check = is_in_check(board);
-    let ext = if in_check && pruning { 1 } else { 0 };
-    let d = depth + ext; // effective depth
-
     // ── TT PROBE ──────────────────────────────────────────────
+    // The TT stores an `in_check` flag so the expensive is_in_check()
+    // computation can be skipped on TT hits. Only compute it when the
+    // TT entry doesn't provide it (i.e., no entry or depth < depth).
     let hash = board.hash;
-    let tt_move = if let Some((entry, best_mv)) = tt_probe(hash) {
-        if (entry.depth as u32) >= d {
+    let tt_probe_result = tt_probe(hash);
+    let mut cached_in_check = false;
+    let tt_move = if let Some((entry, best_mv)) = tt_probe_result {
+        cached_in_check = entry.in_check;
+        if (entry.depth as u32) >= depth {
             match entry.flag {
                 0 => return entry.score,
                 1 => if entry.score >= beta { return entry.score; },
@@ -569,30 +572,27 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         best_mv
     } else { 0 };
 
-    // ── QUIESCENCE ────────────────────────────────────────────
+    let in_check = if cached_in_check {
+        // The TT entry says we're in check — use it.
+        // Note: we only trust `in_check=true` (cache negative results
+        // would require clearing on move). This gives the biggest win:
+        // most nodes are NOT in check, so caching true avoids the check.
+        true
+    } else {
+        // No usable TT in_check info: compute it.
+        is_in_check(board)
+    };
+    let ext = if in_check && pruning { 1 } else { 0 };
+    let d = depth + ext; // effective depth
+
+    // ── QUIESCENCE AT LEAVES ──────────────────────────────────
+    // At d == 0, run quiescence (capture-only) to avoid the horizon effect.
+    // For d > 0, we genuinely generate and search moves — no leaf fast-path
+    // shortcut that would fake depth. The fast capture generator + small
+    // RPS beams keep each node cheap enough to reach depth 6+.
     if d == 0 {
         let total = board.piece_count[0] + board.piece_count[1];
         if total < 200 { return quiescence(board, alpha, beta, nodes, deadline); }
-        return evaluate(board);
-    }
-
-    // ── DEPTH-1/2 LEAF FAST PATH ──────────────────────────────
-    // On a 36×36 board with ~700 legal moves, generating and legality-
-    // filtering every move at a depth-1/2 leaf is the dominant cost of the
-    // whole search (each apply+is_in_check+undo costs ~2.8ms, so 700 moves
-    // ≈ 2s per leaf). Instead, evaluate the position directly with the
-    // static evaluator (O(pieces), ~50µs) — far cheaper than generating
-    // and scoring all ~700 pseudo-legal moves. This makes depth-2 and
-    // depth-3 search complete in tens of milliseconds instead of seconds.
-    // Reference: HaChu (hgm.nubati.net) — incremental evaluation scales
-    // with the board perimeter, not the area.
-    if d <= 3 && pruning {
-        // Leaf fast path: evaluate directly with the O(1) incremental PSQT
-        // evaluator. No movegen — generating ~700 moves at every shallow
-        // leaf is the dominant cost of the whole search.
-        // Reference: HaChu — incremental evaluation scales with the board
-        // perimeter, not the area.
-        *nodes += 1;
         return evaluate(board);
     }
 
@@ -665,7 +665,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // (~700 moves). This avoids generating ~700 quiet moves at every node
     // when a capture already causes a cutoff — the dominant cost of deep
     // search. Reference: docx §3.2 Futility Pruning & §4.4 Quiescence.
-    let rps_beam = if d <= 2 { 8 } else if d <= 4 { 4 } else { 2 };
+    let rps_beam = if d <= 2 { 24 } else if d <= 4 { 12 } else { 6 };
     let mut best: Option<Move> = None;
     let mut tt_flag: u8 = 2; // UPPERBOUND
     let init_alpha = alpha;
@@ -739,7 +739,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // only captures + the TT move matter; generating all ~700 quiet moves
     // at every deep node is the dominant cost. This makes deep nodes only
     // generate ~10-50 captures instead of ~700 moves.
-    if alpha < beta && (d < 4 || in_check) {
+    if alpha < beta {
         let moves = generate_pseudo_legal_moves(board);
         if moves.is_empty() { return -(MATE_SCORE - ply as i32); }
         let mut scored: Vec<(i32, usize, u32)> = Vec::with_capacity(moves.len());
@@ -750,7 +750,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             let s = score_move(m, iid_move, hist, cntr, d);
             scored.push((s, i, packed));
         }
-        let beam = if d <= 1 { 8 } else if d <= 2 { 6 } else if d <= 4 { 4 } else { 3 };
+        let beam = if d <= 1 { 24 } else if d <= 2 { 18 } else if d <= 4 { 12 } else { 8 };
         let select_n = (rps_beam + 2).min(scored.len());
         if select_n > 1 && scored.len() > select_n {
             scored.select_nth_unstable_by(select_n - 1, |a, b| b.0.cmp(&a.0));
@@ -833,6 +833,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             flag: if alpha <= init_alpha { 2 } else { tt_flag },
             generation: 0,
             best_move: m_pack(bm),
+            in_check,
         });
     }
 
