@@ -141,6 +141,14 @@ fn history_store(from: usize, to: usize, depth: u32) {
     }).ok();
 }
 
+fn history_malus(from: usize, to: usize, depth: u32) {
+    let idx = (from % HIST_SZ) * HIST_SZ + (to % HIST_SZ);
+    let malus = (depth * depth).min(400) as i32;
+    history()[idx].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(malus).max(0))
+    }).ok();
+}
+
 fn history_score(from: usize, to: usize) -> i32 {
     let idx = (from % HIST_SZ) * HIST_SZ + (to % HIST_SZ);
     history()[idx].load(Ordering::Relaxed)
@@ -471,11 +479,30 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
             if Instant::now() >= dl { break; }
         }
 
+        // ── PREDICTIVE TIME MANAGEMENT ────────────────────────
+        // The next iteration typically costs 3-5x the previous one (branching
+        // factor). If the elapsed time is already more than ~45% of the
+        // budget, the next iteration cannot possibly finish — stop here and
+        // keep the last completed iteration's result instead of burning the
+        // remaining time on an unusable partial score. (Classic technique:
+        // predict iteration cost from the previous one, e.g. Stockfish.)
+        if current_depth >= 2 {
+            if deadline.is_some() {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                if elapsed_ms.saturating_mul(20) >= time_limit_ms.saturating_mul(9) { break; }
+            }
+        }
+
         let result = if current_depth <= 1 {
             search_root_window(board, current_depth, deadline, root_hint, -MATE_SCORE - 1, MATE_SCORE + 1)
-        } else if current_depth <= 4 {
-            // Shallow depths: small aspiration window is fine.
-            let mut window = 64i32;
+        } else {
+            // Aspiration windows at ALL depths >= 2. The previous version
+            // disabled them for d >= 5 because a *narrow* (±64) window failed
+            // constantly on this game's volatile scores, causing many
+            // expensive re-searches. A wider initial window (±200) plus
+            // geometric growth (×4) fails rarely while still shrinking the
+            // root search cost when the score is stable.
+            let mut window = if current_depth <= 4 { 64i32 } else { 200i32 };
             let mut alpha = score_guess.saturating_sub(window);
             let mut beta = score_guess.saturating_add(window);
             let mut local_result;
@@ -484,14 +511,8 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
                 if let Some(dl) = deadline {
                     if Instant::now() >= dl { break; }
                 }
-                if local_result.score <= alpha {
-                    window = (window * 2).min(4096);
-                    alpha = score_guess.saturating_sub(window);
-                    beta = score_guess.saturating_add(window);
-                    continue;
-                }
-                if local_result.score >= beta {
-                    window = (window * 2).min(4096);
+                if local_result.score <= alpha || local_result.score >= beta {
+                    window = (window * 4).min(8192);
                     alpha = score_guess.saturating_sub(window);
                     beta = score_guess.saturating_add(window);
                     continue;
@@ -499,12 +520,6 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
                 break;
             }
             local_result
-        } else {
-            // Deep searches (d >= 5): use full window to avoid expensive
-            // aspiration re-searches. On a 36×36 board, each root search
-            // is costly enough that re-searching 4-8 times blows the time
-            // budget. The full window is cheaper than multiple re-searches.
-            search_root_window(board, current_depth, deadline, root_hint, -MATE_SCORE - 1, MATE_SCORE + 1)
         };
 
         if deadline.map(|dl| Instant::now() >= dl).unwrap_or(false) { break; }
@@ -673,6 +688,8 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     let mut tt_flag: u8 = 2; // UPPERBOUND
     let init_alpha = alpha;
     let mut searched = false;
+    // Quiets tried so far at this node (for history malus on beta cutoff).
+    let mut quiet_tried: Vec<(usize, usize)> = Vec::new();
 
     // Stage 1: captures + promotions (tactical moves).
     // Use the bitboard attack generator (O(attacked squares) for non-sliding
@@ -702,6 +719,20 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
         }
         let m = &cap_moves[idx];
+        // ── CAPTURE FUTILITY PRUNING (depth ≤ 2) ──────────────
+        // If even capturing the most valuable pieces on the board plus a
+        // safety margin cannot lift the static eval to alpha, this capture
+        // cannot possibly raise the score. With ~700 legal moves per node on
+        // a 36×36 board, dropping hopeless captures cheaply (O(1) estimate)
+        // is a large win — we avoid the full apply + is_in_check + search.
+        if pruning && d <= 2 && !in_check && move_idx > 0
+            && order_score < 1_000_000 && alpha > -MATE_SCORE + 100
+        {
+            let values = piece_vals();
+            let from_pt = cell_piece(board.cells[m.from_sq as usize]);
+            let gain = capture_qs_score(board, m, values) + values[from_pt as usize];
+            if static_eval + gain + 140 <= alpha { continue; }
+        }
         let from_cell = board.cells[m.from_sq as usize];
         let is_king_move = pieces::is_royal(cell_piece(from_cell));
         board.apply_move(m);
@@ -732,6 +763,12 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
                 history_store(m.from_sq as usize, m.to_sq as usize, d);
             }
             if prev_move != 0 { counter_store(prev_move, packed); }
+            // History gravity: penalize the quiets that failed to cause a
+            // cutoff, so next time the cutting move (and similar ones) are
+            // tried first. (Standard technique: Stockfish's history malus.)
+            for &(hf, ht) in quiet_tried.iter() {
+                history_malus(hf, ht, d);
+            }
             break;
         }
     }
@@ -776,6 +813,16 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             {
                 continue;
             }
+            // ── QUIET FUTILITY PRUNING (depth ≤ 2) ────────────
+            // A quiet move at low depth cannot change the eval by more than a
+            // small margin; if even that margin cannot reach alpha, skip the
+            // move entirely (avoids apply + is_in_check + subtree on the
+            // hundreds of remaining quiets at each node).
+            if pruning && d <= 2 && !in_check && move_idx > 0
+                && order_score < 1_000_000 && alpha > -MATE_SCORE + 100
+            {
+                if static_eval + 120 * d as i32 + 60 <= alpha { continue; }
+            }
             if move_idx > 0 {
                 if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
             }
@@ -788,6 +835,9 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
                 continue;
             }
             searched = true;
+            if order_score < 1_000_000 {
+                quiet_tried.push((m.from_sq as usize, m.to_sq as usize));
+            }
             let singular_ext = pruning && d >= 6 && !in_check && tt_move != 0 && packed == tt_move && order_score < 1_000_000;
             let reduction = if pruning && move_idx >= 3 && d >= 3
                 && order_score < 1_000_000 && !in_check
@@ -875,6 +925,7 @@ fn capture_qs_score(board: &Board, m: &Move, values: &[i32; 512]) -> i32 {
 fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
                     nodes: &mut u64, deadline: Option<Instant>, qd: u32) -> i32 {
     *nodes += 1;
+    let init_q_alpha = alpha;
     // Same reasoning as pvs(): nodes here are expensive (movegen ~120-180us),
     // so check the clock much more often than a typical chess engine would.
     if *nodes & 127 == 0 {
@@ -887,6 +938,22 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
             GameResult::WhiteWins => if board.side_to_move == WHITE { MATE_SCORE - qd as i32 } else { -(MATE_SCORE - qd as i32) },
             GameResult::Draw => 0,
         };
+    }
+
+    // ── TT PROBE (quiescence) ─────────────────────────────────────
+    // Reuse shallow results at leaf nodes: on a 36×36 board the transposition
+    // count in quiescence is enormous (captures transpose constantly), so
+    // caching here saves whole quiescence subtrees.
+    let q_hash = board.hash;
+    if qd > 0 {
+        if let Some((entry, _)) = tt_probe(q_hash) {
+            match entry.flag {
+                0 => return entry.score,
+                1 => if entry.score >= beta { return entry.score; },
+                2 => if entry.score <= alpha { return entry.score; },
+                _ => {}
+            }
+        }
     }
 
     // Stand pat
@@ -922,6 +989,17 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
         board.undo_move();
         if score >= beta { return beta; }
         if score > alpha { alpha = score; }
+    }
+
+    if qd > 0 {
+        tt_store(q_hash, TTEntry {
+            score: alpha,
+            depth: 0,
+            flag: if alpha <= init_q_alpha { 2 } else { 0 },
+            generation: 0,
+            best_move: 0,
+            in_check: false,
+        });
     }
     alpha
 }
