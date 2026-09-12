@@ -284,36 +284,12 @@ fn filter_legal_moves(board: &Board, mut moves: Vec<Move>) -> Vec<Move> {
     let mut legal_moves = Vec::with_capacity(moves.len());
     let mut board_copy = board.clone_without_history();
 
-    #[cfg(debug_assertions)]
-    {
-        for (i, m) in moves.drain(..).enumerate() {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let undo = board_copy.apply_move_with_undo(&m);
-                let legal = !is_in_check(&board_copy);
-                board_copy.undo_move_with_info(undo);
-                legal
-            }));
-            match result {
-                Ok(true) => legal_moves.push(m),
-                Ok(false) => {},
-                Err(_) => {
-                    eprintln!("PANIC applying move #{}: {:?}", i, m);
-                    eprintln!("board_copy side_to_move={} piece_counts={:?} piece_list_len={:?}", board_copy.side_to_move, board_copy.piece_count, board_copy.piece_list_len);
-                    panic!("move application panic for debug");
-                }
-            }
+    for m in moves.drain(..) {
+        board_copy.apply_move(&m);
+        if !is_in_check(&board_copy) {
+            legal_moves.push(m);
         }
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        for m in moves.drain(..) {
-            let undo = board_copy.apply_move_with_undo(&m);
-            if !is_in_check(&board_copy) {
-                legal_moves.push(m);
-            }
-            board_copy.undo_move_with_info(undo);
-        }
+        board_copy.undo_move();
     }
 
     legal_moves
@@ -780,14 +756,16 @@ fn gen_range_capture(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
                 }
                 moves.push(m);
             } else {
-                if cell_color(target) == color {
-                    break;
-                }
                 let t_pt = cell_piece(target);
                 let t_rank = pieces::rank(t_pt);
                 if t_rank > piece_rank {
-                    captured_list.push((rsq, t_pt, cell_color(target)));
-                    shared = Some(Rc::new(captured_list.clone()));
+                    // The move that STOPS at rsq captures rsq via `captured_piece`;
+                    // `range_caps` must hold only the INTERMEDIATE squares (shared
+                    // BEFORE rsq). Including rsq itself in range_caps made undo
+                    // restore the destination piece twice (double add -> piece_list
+                    // overflow). Record rsq for SUBSEQUENT (further) moves only
+                    // after building the move to rsq.
+                    let this_shared = shared.clone();
                     let from_in = in_promo_zone(sq, color);
                     let to_in = in_promo_zone(rsq as usize, color);
                     let may_promo = can_promote(pt) && (
@@ -799,28 +777,32 @@ fn gen_range_capture(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
                         let mut m = Move::simple(sq as u16, rsq);
                         m.captured_piece = t_pt;
                         m.captured_color = cell_color(target);
-                        m.range_caps = shared.clone();
+                        m.range_caps = this_shared.clone();
                         m.promotion = true;
                         moves.push(m);
                     } else if may_promo {
                         let mut m1 = Move::simple(sq as u16, rsq);
                         m1.captured_piece = t_pt;
                         m1.captured_color = cell_color(target);
-                        m1.range_caps = shared.clone();
+                        m1.range_caps = this_shared.clone();
                         moves.push(m1);
                         let mut m2 = Move::simple(sq as u16, rsq);
                         m2.captured_piece = t_pt;
                         m2.captured_color = cell_color(target);
-                        m2.range_caps = shared.clone();
+                        m2.range_caps = this_shared.clone();
                         m2.promotion = true;
                         moves.push(m2);
                     } else {
                         let mut m = Move::simple(sq as u16, rsq);
                         m.captured_piece = t_pt;
                         m.captured_color = cell_color(target);
-                        m.range_caps = shared.clone();
+                        m.range_caps = this_shared.clone();
                         moves.push(m);
                     }
+                    // Record rsq so further moves along this ray capture it as an
+                    // intermediate square.
+                    captured_list.push((rsq, t_pt, cell_color(target)));
+                    shared = Some(Rc::new(captured_list.clone()));
                 } else {
                     break;
                 }

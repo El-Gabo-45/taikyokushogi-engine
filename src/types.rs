@@ -75,14 +75,38 @@ pub fn sq_index(row: usize, col: usize) -> usize {
     row * BOARD_SIZE + col
 }
 
+/// Per-square row lookup (compile-time precomputed), replacing `sq / BOARD_SIZE`.
+/// Division by a non-power-of-two in a hot per-piece movegen loop is measurably
+/// slower than a cached 1-byte table load on giant (36×36) boards.
+static SQ_ROW: [u8; NUM_SQUARES] = const {
+    let mut a = [0u8; NUM_SQUARES];
+    let mut i = 0usize;
+    while i < NUM_SQUARES {
+        a[i] = (i / BOARD_SIZE) as u8;
+        i += 1;
+    }
+    a
+};
+
+/// Per-square column lookup (compile-time precomputed), replacing `sq % BOARD_SIZE`.
+static SQ_COL: [u8; NUM_SQUARES] = const {
+    let mut a = [0u8; NUM_SQUARES];
+    let mut i = 0usize;
+    while i < NUM_SQUARES {
+        a[i] = (i % BOARD_SIZE) as u8;
+        i += 1;
+    }
+    a
+};
+
 #[inline]
 pub fn sq_row(sq: usize) -> usize {
-    sq / BOARD_SIZE
+    SQ_ROW[sq] as usize
 }
 
 #[inline]
 pub fn sq_col(sq: usize) -> usize {
-    sq % BOARD_SIZE
+    SQ_COL[sq] as usize
 }
 
 /// Get direction deltas adjusted for color.
