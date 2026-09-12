@@ -1,3 +1,19 @@
+//! Alpha-beta search for Taikyoku Shogi (36x36 board, ~700 legal moves/node).
+//!
+//! Components:
+//! * Transposition table: 2^22 buckets x 4 entries; hash and payload live in
+//!   separate AtomicU64 slots. Payload is published BEFORE the hash
+//!   (Release) and re-verified after read (Acquire) so concurrent writers
+//!   never yield a torn entry.
+//! * Move-ordering heuristics: TT move, MVV-LVA, two killers per ply,
+//!   counter moves, history with bonus (on cutoff) and malus (gravity).
+//! * Search: iterative deepening with aspiration windows, PVS with
+//!   null-window re-search, late move reductions (history-softened),
+//!   null-move pruning, razoring / reverse futility / futility / ProbCut,
+//!   staged move generation (captures first, quiets only if needed) with
+//!   incremental pick-next ordering, check extension on in-check nodes.
+//! * Quiescence with its own TT traffic (stores the real in_check flag).
+
 use crate::types::*;
 use crate::pieces;
 use crate::board::Board;
@@ -37,6 +53,13 @@ fn tt_index(hash: u64) -> usize { ((hash as usize) & (TT_SIZE - 1)) * TT_BUCKET_
 const TT_MOVE_MASK: u64 = (1 << 25) - 1;
 const TT_CHECK_MASK: u64 = 1 << 25;
 
+// ── Move-ordering score constants ────────────────────────────────
+const TT_MOVE_SCORE: i32 = 2_000_000;   // hash move always first
+const ROOT_HINT_SCORE: i32 = 3_000_000; // previous-iteration best-move bonus
+const KILLER1_SCORE: i32 = 90_000;
+const KILLER2_SCORE: i32 = 80_000;
+const COUNTER_SCORE: i32 = 70_000;
+
 #[inline]
 fn tt_pack(entry: &TTEntry, gen: u8) -> u64 {
     let sc = entry.score.clamp(-32000, 32000) as i16 as u16;
@@ -64,7 +87,7 @@ fn tt_unpack(packed: u64) -> TTEntry {
 static TT_GEN: AtomicU64 = AtomicU64::new(1);
 fn tt_gen() -> u8 { (TT_GEN.load(Ordering::Relaxed) & 0xFF) as u8 }
 
-fn tt_probe(hash: u64) -> Option<(TTEntry, u32)> {
+fn tt_probe(hash: u64) -> Option<TTEntry> {
     let base = tt_index(hash);
     let t = tt();
     for i in 0..TT_BUCKET_WIDTH {
@@ -80,7 +103,7 @@ fn tt_probe(hash: u64) -> Option<(TTEntry, u32)> {
             if t[idx].load(Ordering::Acquire) != stored {
                 continue; // slot overwritten mid-read — try next bucket slot
             }
-            if entry.depth >= 0 { return Some((entry, entry.best_move)); }
+            if entry.depth >= 0 { return Some(entry); }
         }
     }
     None
@@ -125,9 +148,13 @@ fn killers() -> &'static Vec<AtomicU64> {
 fn killer_store(depth: u32, mv: u32) {
     let d = depth.min(127) as usize;
     let slot = &killers()[d];
-    let cur = slot.load(Ordering::Relaxed);
-    let mv0 = cur as u32;
-    if mv != mv0 { slot.store(mv as u64 | ((mv0 as u64) << 32), Ordering::Relaxed); }
+    // Atomic read-modify-write: a plain load+store is not atomic and, under
+    // Lazy SMP, two threads can overwrite each other and drop the old
+    // first killer. fetch_update makes the swap race-free.
+    let _ = slot.fetch_update(Ordering::Release, Ordering::Relaxed, |cur| {
+        let mv0 = cur as u32;
+        if mv == mv0 { None } else { Some(mv as u64 | ((mv0 as u64) << 32)) }
+    });
 }
 
 fn killer_score(depth: u32, mv: u32) -> i32 {
@@ -135,7 +162,7 @@ fn killer_score(depth: u32, mv: u32) -> i32 {
     let p = killers()[d].load(Ordering::Relaxed);
     let mv0 = p as u32;
     let mv1 = (p >> 32) as u32;
-    if mv == mv0 { 90000 } else if mv == mv1 { 80000 } else { 0 }
+    if mv == mv0 { KILLER1_SCORE } else if mv == mv1 { KILLER2_SCORE } else { 0 }
 }
 
 // ── History ─────────────────────────────────────────────────────
@@ -183,7 +210,7 @@ fn counter_store(prev: u32, mv: u32) {
 fn counter_score(prev: u32, mv: u32) -> i32 {
     if prev == 0 { return 0; }
     let stored = counter()[(prev as usize) & 0xFFFF].load(Ordering::Relaxed) as u32;
-    if stored == mv { 70000 } else { 0 }
+    if stored == mv { COUNTER_SCORE } else { 0 }
 }
 fn counter_clear() {
     if let Some(c) = COUNTER.get() { for cell in c { cell.store(0, Ordering::Relaxed); } }
@@ -217,12 +244,10 @@ fn is_tactical(m: &Move) -> bool {
 
 // ── Move ordering ───────────────────────────────────────────────
 // Priority: 1) Hash move (TT)  2) MVV-LVA captures  3) Killers  4) History  5) Counter
-
-// ── Move ordering ───────────────────────────────────────────────
 fn score_move(m: &Move, tt_move: u32, hist: i32, cntr: i32, depth: u32) -> i32 {
     let packed = m_pack(m);
     // 1) Hash move (from TT)
-    if packed == tt_move { return 2_000_000; }
+    if packed == tt_move { return TT_MOVE_SCORE; }
     // 2) Captures: MVV-LVA
     if is_tactical(m) {
         let vals = piece_vals();
@@ -284,7 +309,7 @@ fn search_root_window(
         let values = piece_vals();
         for m in &moves {
             nodes += 1;
-            // ── LEGALITY FILTER (was completely missing) ──────────
+            // ── LEGALITY FILTER ──────────
             // The pure material-delta shortcut scored pseudo-legal moves
             // that leave our own royal attacked — kings stepping into
             // attack, pinned sliders moving off the pin — with full
@@ -321,7 +346,7 @@ fn search_root_window(
     let mut nodes: u64 = 0;
     let mut best_move = None;
     let mut best_score = -MATE_SCORE - 1;
-    let root_tt_move = tt_probe(board.hash).map(|(_, mv)| mv).unwrap_or(0);
+    let root_tt_move = tt_probe(board.hash).map(|e| e.best_move).unwrap_or(0);
 
     // ── ROOT-LEVEL STAGED GENERATION ──────────────────────────
     // Generate captures first (cheap, ~10-50 moves), search them. Only if
@@ -329,49 +354,18 @@ fn search_root_window(
     // (~700 moves). This avoids generating + sorting all ~700 root moves
     // when a capture already causes a cutoff — the dominant cost of deep
     // search. Reference: docx §3.2 Futility Pruning & §4.4 Quiescence.
-    let max_moves = if depth <= 1 {
-        // Depth 1: search all moves (cheap material-delta path).
-        let moves = generate_pseudo_legal_moves(board);
-        if moves.is_empty() {
-            return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: start.elapsed().as_millis() as u64 };
-        }
-        let mut scored: Vec<(i32, usize)> = Vec::with_capacity(moves.len());
-        for (i, m) in moves.iter().enumerate() {
-            let packed = m_pack(m);
-            let hist = history_score(m.from_sq as usize, m.to_sq as usize);
-            let mut s = score_move(m, root_tt_move, hist, 0, depth);
-            if root_hint == Some(packed) { s += 3_000_000; }
-            scored.push((s, i));
-        }
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        for rank in 0..scored.len() {
-            let idx = scored[rank].1;
-            let m = &moves[idx];
-            board.apply_move(m);
-            nodes += 1;
-            let score = -pvs(board, depth - 1, -MATE_SCORE - 1, MATE_SCORE + 1,
-                            &mut nodes, deadline, 0, true, m_pack(m));
-            board.undo_move();
-            if score > best_score {
-                best_score = score;
-                best_move = Some(m.clone());
-            }
-        }
-        return SearchResult { best_move, score: best_score, nodes, time_ms: start.elapsed().as_millis() as u64 };
-    } else {
-        // Full root breadth: rank and search ALL root moves every iteration
-        // (~500+). The root is a single node, so generating + ranking the
-        // whole list is a negligible fraction of the tree, and the previous
-        // 6-48 "RPS beam" discarded most candidate moves (the "500 -> ~50"
-        // regression: only a handful of captures and, at depth>=4, no quiet
-        // moves at all). Internal nodes keep their own beams, so depth is
-        // preserved by pruning BELOW the root.
-        usize::MAX
-    };
+    // Full root breadth: rank and search ALL root moves every iteration
+    // (~500+). The root is a single node, so generating + ranking the whole
+    // list is a negligible fraction of the tree, and a narrow root beam
+    // would discard most candidate moves. Internal nodes keep their own
+    // beams, so depth is preserved by pruning BELOW the root.
+    // (depth <= 3 never reaches here: the material-delta fast path above
+    // returns early, so no per-depth branch is needed at the root.)
+    let max_moves = usize::MAX;
 
     if depth > 2 {
         let _ = pvs(board, depth - 2, -MATE_SCORE - 1, MATE_SCORE + 1,
-                    &mut nodes, deadline, 0, true, 0);
+                    &mut nodes, deadline, 0, 0);
     }
 
     // Stage 1: captures + promotions (tactical moves).
@@ -388,7 +382,7 @@ fn search_root_window(
         let packed = m_pack(m);
         let hist = history_score(m.from_sq as usize, m.to_sq as usize);
         let mut s = score_move(m, root_tt_move, hist, 0, depth);
-        if root_hint == Some(packed) { s += 3_000_000; }
+        if root_hint == Some(packed) { s += ROOT_HINT_SCORE; }
         cap_scored.push((s, i));
     }
     cap_scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
@@ -405,17 +399,17 @@ fn search_root_window(
             (-MATE_SCORE - 1, -best_score.max(-MATE_SCORE - 1))
         };
         let score = if rank == 0 {
-            -pvs(board, depth - 1, sa, sb, &mut nodes, deadline, 0, true, m_pack(m))
+            -pvs(board, depth - 1, sa, sb, &mut nodes, deadline, 0, m_pack(m))
         } else {
-            let nw = -pvs(board, depth - 1, -sa - 1, -sa, &mut nodes, deadline, 0, true, m_pack(m));
+            let nw = -pvs(board, depth - 1, -sa - 1, -sa, &mut nodes, deadline, 0, m_pack(m));
             if nw > sa && nw < sb {
-                -pvs(board, depth - 1, -sb, -sa, &mut nodes, deadline, 0, true, m_pack(m))
+                -pvs(board, depth - 1, -sb, -sa, &mut nodes, deadline, 0, m_pack(m))
             } else { nw }
         };
         if score <= sa || score >= sb {
             let full = -pvs(board, depth - 1, -MATE_SCORE - 1,
                             -best_score.max(-MATE_SCORE - 1),
-                            &mut nodes, deadline, 0, true, m_pack(m));
+                            &mut nodes, deadline, 0, m_pack(m));
             if full > best_score { best_score = full; best_move = Some(m.clone()); }
         } else if score > best_score {
             best_score = score;
@@ -440,7 +434,7 @@ fn search_root_window(
             let packed = m_pack(m);
             let hist = history_score(m.from_sq as usize, m.to_sq as usize);
             let mut s = score_move(m, root_tt_move, hist, 0, depth);
-            if root_hint == Some(packed) { s += 3_000_000; }
+            if root_hint == Some(packed) { s += ROOT_HINT_SCORE; }
             scored.push((s, i));
         }
         scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
@@ -456,17 +450,17 @@ fn search_root_window(
                 (-MATE_SCORE - 1, -best_score.max(-MATE_SCORE - 1))
             };
             let score = if rank == 0 {
-                -pvs(board, depth - 1, sa, sb, &mut nodes, deadline, 0, true, m_pack(m))
+                -pvs(board, depth - 1, sa, sb, &mut nodes, deadline, 0, m_pack(m))
             } else {
-                let nw = -pvs(board, depth - 1, -sa - 1, -sa, &mut nodes, deadline, 0, true, m_pack(m));
+                let nw = -pvs(board, depth - 1, -sa - 1, -sa, &mut nodes, deadline, 0, m_pack(m));
                 if nw > sa && nw < sb {
-                    -pvs(board, depth - 1, -sb, -sa, &mut nodes, deadline, 0, true, m_pack(m))
+                    -pvs(board, depth - 1, -sb, -sa, &mut nodes, deadline, 0, m_pack(m))
                 } else { nw }
             };
             if score <= sa || score >= sb {
                 let full = -pvs(board, depth - 1, -MATE_SCORE - 1,
                                 -best_score.max(-MATE_SCORE - 1),
-                                &mut nodes, deadline, 0, true, m_pack(m));
+                                &mut nodes, deadline, 0, m_pack(m));
                 if full > best_score { best_score = full; best_move = Some(m.clone()); }
             } else if score > best_score {
                 best_score = score;
@@ -487,6 +481,8 @@ fn search_root_window(
 
 pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult {
     let start = Instant::now();
+    // env::var takes a global lock — cache it once per search, not per iteration.
+    let debug_log = std::env::var_os("RPS_DEBUG").is_some();
     let deadline = if time_limit_ms > 0 {
         Some(start + std::time::Duration::from_millis(time_limit_ms))
     } else { None };
@@ -566,7 +562,7 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
 
         if deadline.map(|dl| Instant::now() >= dl).unwrap_or(false) { break; }
         total_nodes = total_nodes.saturating_add(result.nodes);
-        if std::env::var("RPS_DEBUG").is_ok() {
+        if debug_log {
             eprintln!("iter d={} nodes={} score={} t={}ms", current_depth, result.nodes, result.score, result.time_ms);
         }
         root_hint = result.best_move.as_ref().map(m_pack);
@@ -594,16 +590,15 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
 // - LMP: Late Move Pruning
 fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
        nodes: &mut u64, deadline: Option<Instant>, ply: u32,
-       pruning: bool, prev_move: u32) -> i32 {
+       prev_move: u32) -> i32 {
+    // Every caller (full window, null-window probe, aspiration) maintains
+    // beta > alpha; the flag logic in the TT store relies on this invariant.
+    debug_assert!(beta > alpha, "pvs requires beta > alpha");
     *nodes += 1;
 
-    // Time check
-    // NOTE: Taikyoku Shogi nodes are ~150-200us each (1296-square board,
-    // 402 pieces/side -> movegen + is_in_check are far costlier than in a
-    // normal chess engine). The old 8191-node interval meant up to ~1.2-1.6s
-    // could pass between deadline checks, badly overshooting time_limit_ms.
-    // 255 keeps the check itself cheap (bitwise AND) while checking the
-    // clock roughly every 40-50ms of real time at this engine's node cost.
+    // Time check: a node on this 1296-square board costs ~150-200us, so the
+    // deadline is polled every 64 nodes (~10-15ms of real time). The bitwise
+    // AND keeps the check itself essentially free.
     if *nodes & 63 == 0 {
         if let Some(dl) = deadline { if Instant::now() >= dl { return alpha; } }
     }
@@ -625,7 +620,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     let tt_probe_result = tt_probe(hash);
     let mut cached_in_check = false;
     let mut has_tt_entry = false;
-    let tt_move = if let Some((entry, best_mv)) = tt_probe_result {
+    let tt_move = if let Some(entry) = tt_probe_result {
         has_tt_entry = true;
         cached_in_check = entry.in_check;
         if (entry.depth as u32) >= depth {
@@ -636,7 +631,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
                 _ => {}
             }
         }
-        best_mv
+        entry.best_move
     } else { 0 };
 
     // Trust the TT `in_check` flag on *any* TT hit (true or false): it was
@@ -646,7 +641,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // is_in_check() ray/bitboard scan every single time. This skips that
     // scan on nearly every TT-hit node.
     let in_check = if has_tt_entry { cached_in_check } else { is_in_check(board) };
-    let ext = if in_check && pruning { 1 } else { 0 };
+    let ext = if in_check { 1 } else { 0 };
     let d = depth + ext; // effective depth
 
     // ── QUIESCENCE AT LEAVES ──────────────────────────────────
@@ -668,14 +663,14 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
 
     // ── RAZORING (depth ≤ 2) ──────────────────────────────────
     // If static_eval + huge_margin ≤ alpha, prune the node entirely
-    if pruning && d <= 2 && !in_check && alpha > -MATE_SCORE + 100 {
+    if d <= 2 && !in_check && alpha > -MATE_SCORE + 100 {
         let margin = match d { 0 => 400, 1 => 600, _ => 900 };
         if static_eval + margin <= alpha { return alpha; }
     }
 
     // ── REVERSE FUTILITY PRUNING (depth ≤ 3) ─────────────────
     // If static_eval - margin ≥ beta, prune (position is too good)
-    if pruning && d <= 3 && !in_check && alpha > -MATE_SCORE + 100 {
+    if d <= 3 && !in_check && alpha > -MATE_SCORE + 100 {
         let margin = 150 + 250 * d as i32;
         if static_eval - margin >= beta { return beta; }
         if static_eval + margin <= alpha { return alpha; }
@@ -683,7 +678,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
 
     // ── FUTILITY PRUNING (depth ≤ 2) ─────────────────────────
     // Skip shallow quiet nodes when even optimistic gains cannot reach alpha.
-    if pruning && d <= 2 && !in_check && alpha > -MATE_SCORE + 100 {
+    if d <= 2 && !in_check && alpha > -MATE_SCORE + 100 {
         let fut_margin = match d {
             0 => 80,
             1 => 160,
@@ -695,13 +690,13 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // ── NULL MOVE PRUNING (depth ≥ 3) ─────────────────────────
     // Give opponent a free move. If even then we're still ≥ beta, prune.
     let side = board.side_to_move as usize;
-    if pruning && d >= 3 && board.no_progress_plies < 100
+    if d >= 3 && board.no_progress_plies < 100
         && board.piece_count[side] > 3 && !in_check
     {
         let r = if d >= 6 { 3 } else { 2 };
         board.null_move();
         let null_score = -pvs(board, d.saturating_sub(r), -beta, -(beta - 1),
-                              nodes, deadline, ply + 1, pruning, 0);
+                              nodes, deadline, ply + 1, 0);
         board.undo_null_move();
         if null_score >= beta { return beta; }
     }
@@ -710,17 +705,17 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // Statistical pruning: if the static eval is far enough below alpha,
     // the probability that any move can raise it above beta is negligible.
     // Reference: "ProbCut" — Kotani, Computer Shogi (docx §3.4).
-    if pruning && d >= 4 && !in_check && alpha > -MATE_SCORE + 100 {
+    if d >= 4 && !in_check && alpha > -MATE_SCORE + 100 {
         let margin = 500 + 300 * d as i32;
         if static_eval + margin <= alpha { return alpha; }
     }
 
     // ── INTERNAL ITERATIVE DEEPENING ──────────────────────────
     // If no TT move, do a shallow search to get one
-    let iid_move = if tt_move == 0 && d >= 4 && pruning {
+    let iid_move = if tt_move == 0 && d >= 4 {
         let iid_d = d / 2 - 1;
-        let _ = pvs(board, iid_d, -beta, -alpha, nodes, deadline, ply, pruning, prev_move);
-        tt_probe(hash).map(|(_, mv)| mv).unwrap_or(0)
+        let _ = pvs(board, iid_d, -beta, -alpha, nodes, deadline, ply, prev_move);
+        tt_probe(hash).map(|e| e.best_move).unwrap_or(0)
     } else { tt_move };
 
     // ── STAGED MOVE GENERATION ────────────────────────────────
@@ -756,11 +751,9 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         cap_moves
     };
     // ── Incremental move selection (pick-next) ────────────────────
-    // The old path built a tuple Vec and FULLY sorted the capture list at
-    // every node even though only `rps_beam` (6-24) moves are ever tried.
-    // We score once into a flat i32 buffer and repeatedly select the best
-    // remaining move (selection over the consumed prefix only): O(k·n) with
-    // k ≈ 6-24, no tuple boxing, and no full O(n log n) sort per node.
+    // Score once into a flat i32 buffer, then repeatedly select the best
+    // remaining move: O(k·n) with k ≈ rps_beam (6-24) instead of a full
+    // O(n log n) sort of the capture list at every node.
     let mut cap_scores: Vec<i32> = Vec::with_capacity(cap_moves.len());
     for m in cap_moves.iter() {
         let packed = m_pack(m);
@@ -799,7 +792,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         // cannot possibly raise the score. With ~700 legal moves per node on
         // a 36×36 board, dropping hopeless captures cheaply (O(1) estimate)
         // is a large win — we avoid the full apply + is_in_check + search.
-        if pruning && d <= 2 && !in_check && cur_move > 0
+        if d <= 2 && !in_check && cur_move > 0
             && order_score < 1_000_000 && alpha > -MATE_SCORE + 100
         {
             let values = piece_vals();
@@ -818,11 +811,11 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         searched = true;
         let new_d = d.saturating_sub(1);
         let score = if cur_move == 0 {
-            -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed)
+            -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, packed)
         } else {
-            let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, pruning, packed);
+            let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, packed);
             if nw > alpha && nw < beta {
-                -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed)
+                -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, packed)
             } else { nw }
         };
         board.undo_move();
@@ -888,7 +881,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             if cur_move > 0 {
                 if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
             }
-            if pruning && d <= 2 && cur_move >= beam && order_score < 1_000_000
+            if d <= 2 && cur_move >= beam && order_score < 1_000_000
                 && alpha > -MATE_SCORE + 100
             {
                 continue;
@@ -898,7 +891,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             // small margin; if even that margin cannot reach alpha, skip the
             // move entirely (avoids apply + is_in_check + subtree on the
             // hundreds of remaining quiets at each node).
-            if pruning && d <= 2 && !in_check && cur_move > 0
+            if d <= 2 && !in_check && cur_move > 0
                 && order_score < 1_000_000 && alpha > -MATE_SCORE + 100
             {
                 if static_eval + 120 * d as i32 + 60 <= alpha { continue; }
@@ -922,8 +915,12 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
                     quiet_tried_n += 1;
                 }
             }
-            let singular_ext = pruning && d >= 6 && !in_check && tt_move != 0 && packed == tt_move && order_score < 1_000_000;
-            let reduction = if pruning && cur_move >= 3 && d >= 3
+            // Hash-move extension: give the TT's best move one extra ply.
+            // NOTE: not a true singular extension (which would re-search at
+            // reduced depth with the TT move EXCLUDED to verify it is the
+            // only good move) — just a depth bump for the hash move.
+            let tt_move_ext = d >= 6 && !in_check && tt_move != 0 && packed == tt_move && order_score < 1_000_000;
+            let reduction = if cur_move >= 3 && d >= 3
                 && order_score < 1_000_000 && !in_check
             {
                 let base = (cur_move / 3).min(3) as u32;
@@ -935,20 +932,20 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
                 (base + depth_factor).saturating_sub(soften)
             } else { 0 };
             let mut new_d = d.saturating_sub(1 + reduction);
-            if singular_ext { new_d = new_d.saturating_add(1); }
+            if tt_move_ext { new_d = new_d.saturating_add(1); }
             let score;
             if cur_move == 0 {
-                score = -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed);
+                score = -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, packed);
             } else if reduction > 0 {
-                let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, pruning, packed);
+                let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, packed);
                 if nw > alpha && nw < beta {
                     score = -pvs(board, d.saturating_sub(1), -beta, -alpha,
-                                nodes, deadline, ply + 1, pruning, packed);
+                                nodes, deadline, ply + 1, packed);
                 } else { score = nw; }
             } else {
-                let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, pruning, packed);
+                let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, packed);
                 if nw > alpha && nw < beta {
-                    score = -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed);
+                    score = -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, packed);
                 } else { score = nw; }
             }
             board.undo_move();
@@ -976,7 +973,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     if searched {
         tt_store(hash, TTEntry {
             score: alpha,
-            depth: d as i8,
+            depth: d.min(120) as i8,
             flag: if alpha <= init_alpha { 2 } else { tt_flag },
             // Coherence: tt_pack overrides this field with the ACTIVE
             // generation, so a hardcoded 0 had no packed effect — but an
@@ -1040,7 +1037,7 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
     // caching here saves whole quiescence subtrees.
     let q_hash = board.hash;
     if qd > 0 {
-        if let Some((entry, _)) = tt_probe(q_hash) {
+        if let Some(entry) = tt_probe(q_hash) {
             match entry.flag {
                 0 => return entry.score,
                 1 => if entry.score >= beta { return entry.score; },
@@ -1104,3 +1101,65 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
     alpha
 }
 
+
+
+// ── Unit tests ──────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::Board;
+
+    #[test]
+    fn tt_pack_unpack_roundtrip() {
+        let entry = TTEntry {
+            score: 1234,
+            depth: 8,
+            flag: 1,
+            generation: 0, // ignored by tt_pack — the gen parameter wins
+            best_move: 0x1234,
+            in_check: true,
+        };
+        let out = tt_unpack(tt_pack(&entry, 7));
+        assert_eq!(out.score, 1234);
+        assert_eq!(out.depth, 8);
+        assert_eq!(out.flag, 1);
+        assert_eq!(out.generation, 7);
+        assert_eq!(out.best_move, 0x1234);
+        assert!(out.in_check);
+        // Score clamping at the ±32000 boundary.
+        let mut big = entry;
+        big.score = 99_000;
+        assert_eq!(tt_unpack(tt_pack(&big, 7)).score, 32_000);
+        big.score = -99_000;
+        assert_eq!(tt_unpack(tt_pack(&big, 7)).score, -32_000);
+    }
+
+    #[test]
+    fn search_initial_reaches_depth_and_finds_a_move() {
+        history_clear();
+        let mut board = Board::initial();
+        let r = board.search(4, 0);
+        assert!(r.best_move.is_some(), "depth-4 search must return a move");
+        assert!(r.nodes > 0);
+        // Deterministic: same input, same output.
+        let mut board2 = Board::initial();
+        let r2 = board2.search(4, 0);
+        assert_eq!(r.nodes, r2.nodes);
+        assert_eq!(r.score, r2.score);
+    }
+
+    #[test]
+    fn history_clear_zeroes_counters() {
+        history_store(3, 4, 5);
+        assert!(history_score(3, 4) > 0);
+        history_clear();
+        assert_eq!(history_score(3, 4), 0);
+        assert_eq!(history_score(0, 0), 0);
+    }
+
+    #[test]
+    fn killer_store_is_read_back() {
+        killer_store(10, 0xABCD);
+        assert_eq!(killer_score(10, 0xABCD), KILLER1_SCORE);
+    }
+}

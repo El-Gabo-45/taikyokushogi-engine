@@ -63,95 +63,163 @@ Each side's 402 pieces occupy 12 ranks. Black occupies the bottom of the board (
 
 ### Requirements
 
-- Python 3.9+
-- Rust toolchain (for the fast Rust backend)
-- `maturin` (`pip install maturin`)
+- A recent stable **Rust toolchain** (the crate targets Rust edition 2021).
+- **Node.js + npm** only if you want to rebuild the `web/` frontend
+  (TypeScript + Vite; a prebuilt `dist/` is committed).
+- **Python 3.9+** only for the NNUE training pipeline in `training/` (see
+  [training/README.md](training/README.md)).
 
-### Build and Run
+### Build
 
 ```bash
-# Clone the repository
 git clone https://github.com/jh85/taikyokushogi.git
 cd taikyokushogi
 
-# Create a virtual environment and install dependencies
-python3 -m venv .venv
-source .venv/bin/activate
-pip install maturin
+# Build the engine, server, CLI tools and examples in release mode
+cargo build --release
+```
 
-# Build the Rust backend
-maturin develop --release
+### Web GUI
 
-# Run the web GUI
-python3 web_gui.py 8080
-# Then open http://localhost:8080 in your browser
+```bash
+# Rebuild the frontend (only needed after editing web/src)
+cd web && npm install && npm run build && cd ..
+
+# Start the HTTP server: REST API + static web frontend
+cargo run --release --bin taikyokushogi-server
+# Then open http://localhost:8000 in your browser
 ```
 
 ### Web GUI Features
 
-- **Human vs Random** — play as Black or White against a random-move player
-- **Random vs Random** — watch two random players with adjustable speed
-- Click a piece to see legal moves highlighted on the board
-- Score graph tracks material balance in real time
-- Piece info panel shows movement details on hover
+- **Game modes**: Human vs Random, Human vs AI, Random vs Random, AI vs AI
+- Play as **Black or White**; pick the AI strength (Random, D1, D2, D3)
+- Click a piece to see its legal moves highlighted on the board
+  (green = move, red = capture)
+- Hover and last-move highlights, board coordinates, kanji piece glyphs
+- Sidebar shows the side to move, move number, piece counts, material
+  score, status and the full move log
+- **New Game** / **Undo** buttons and an **Auto** play toggle
 
-### Other Modes
+### REST API
+
+The server exposes a small JSON REST API — `/api/state`, `/api/moves`,
+`/api/piece-info/{abbrev}`, `/api/new-game`, `/api/move`, `/api/ai-move`,
+`/api/undo` — consumed by the frontend in `web/src/api/client.ts`.
+See `src/main.rs` for the route handlers.
+
+### Command-Line Tools
+
+| Binary | Purpose |
+|---|---|
+| `taikyokushogi-server` | HTTP server + web GUI (REST API in `src/main.rs`) |
+| `debug-cli` | CLI search harness: best move, score, nodes, time |
+| `selfplay` | Self-play training-data generator for the NNUE pipeline |
 
 ```bash
-# USI protocol mode (for GUI software)
-source .venv/bin/activate
-python3 -m taikyoku_engine
+# Search the initial position at depth 5 with a 10 s time limit
+cargo run --release --bin debug-cli 5 10000
 
-# Quick demo (board info + move count)
-python3 -m taikyoku_engine demo
-
-# Random game in terminal
-python3 -m taikyoku_engine random 200
+# Generate 100 self-play games (depth 3, 4 workers, 200 ms per move)
+cargo run --release --bin selfplay 100 3 0 4 200
+# -> writes training_data/samples_*.bin and training_data/games.db
 ```
 
-### Pure Python (no Rust)
+### Examples and Benchmarks
 
-If you cannot install Rust, the engine falls back to pure Python automatically. Everything works, just slower (~80x slower for search).
+All examples run with `cargo run --release --example <name>`:
+
+| Example | Purpose |
+|---|---|
+| `bench_fixed` | Deterministic fixed-depth search benchmark (depths as args) |
+| `bench_nps` | NPS + component timing (movegen, eval, apply/undo) + bottleneck analysis |
+| `check_movecounts` | Legal move count from the initial position |
+| `stress_undo` | Apply/undo stress test (checks the board state round-trips) |
+| `bench`, `bench_deep`, `bench_depth1`, `bench_midgame`, `bench_thorough`, `bench_time` | Additional benchmarks |
+| `export_piece_metadata` | Writes `training/piece_metadata.json` for the NNUE pipeline |
+| `toggle_nnue` | Runtime NNUE on/off smoke test |
+| `play` | Minimal command-line game loop |
+| `check_db` | Self-play SQLite database sanity checks |
 
 ```bash
-python3 web_gui.py 8080
+cargo run --release --example bench_fixed 4 5 6   # fixed-depth search at depths 4, 5, 6
+cargo run --release --example check_movecounts    # -> 512 legal moves
+cargo run --release --example bench_nps           # full benchmark report
 ```
 
 ## Project Structure
 
 ```
-taikyokushogi/
-  src/                    # Rust engine (PyO3)
-    lib.rs                #   Public API + Python bindings
-    python.rs             #   PyO3 bindings (behind feature flag)
-    types.rs              #   Core types, ray tables
-    pieces.rs             #   301 piece types, Betza parser
-    board.rs              #   Board representation
-    movegen.rs            #   Legal move generation
-    eval.rs               #   Static evaluation
-    search.rs             #   Alpha-beta search
-  taikyoku_engine/        # Python engine (fallback)
-    pieces.py             #   Piece data
-    board.py              #   Board class
-    movegen.py            #   Move generation
-    evaluation.py         #   Evaluation
-    search.py             #   Search
-    usi.py                #   USI protocol
-  web_gui.py              # Browser-based game GUI
-  PIECES.md               # Complete piece movement reference
-  Cargo.toml              # Rust project config
-  pyproject.toml          # Python/maturin build config
+taikyokushogi-engine/
+  src/
+    lib.rs              # Public crate API (Board, Move, PieceInfo, search, TSFEN, ...)
+    main.rs             # HTTP server + REST API + static web GUI   (bin: taikyokushogi-server)
+    debug_cli.rs        # CLI search harness                        (bin: debug-cli)
+    selfplay_main.rs    # Self-play entry point                     (bin: selfplay)
+    selfplay.rs         # Self-play logic + TrainingSample binary format
+    types.rs            # Core types, constants, ray tables
+    pieces.rs           # 301 piece types, Betza notation parser
+    board.rs            # Board representation, apply/undo, game rules
+    movegen.rs          # Legal move generation
+    attack.rs           # Attack / ray bitboards
+    bitboard.rs         # Bitboard helpers
+    search.rs           # PVS + TT + move ordering + pruning + quiescence + Lazy SMP
+    tsfen.rs            # TSFEN position notation (encode / parse)
+    eval/
+      mod.rs            # Evaluator dispatcher (hand-crafted <-> NNUE)
+      families.rs       # Piece-family material values
+      psqt.rs           # Piece-square tables
+      zones.rs          # Threat zones and king-safety heuristics
+      nnue.rs           # NNUE (HalfKP-style) neural evaluator + .nnue loader
+    debugging/          # Search/eval introspection utilities
+  examples/             # Benchmarks, smoke tests and tooling (see above)
+  web/                  # TypeScript + Vite frontend (served by the Rust server)
+    src/
+      main.ts           #   Entry point
+      game/state.ts     #   Game state machine + modes
+      api/client.ts     #   REST client
+      ui/               #   Canvas renderer, input controller, sidebar panels
+      data/kanji.ts     #   Piece kanji glyphs
+  training/             # NNUE PyTorch pipeline — see training/README.md
+  training_data/        # Generated self-play .bin samples + games.db
+  PIECES.md             # Complete piece movement reference
+  Cargo.toml            # Rust project config (bins, features, examples)
 ```
 
 ## Performance
 
-| Benchmark | Python | Rust | Speedup |
-|---|---|---|---|
-| Legal move generation | 1.35 ms | 0.28 ms | 5x |
-| Depth-1 search | 145 ms | 1.9 ms | 76x |
-| Depth-2 search | 3,017 ms | 38 ms | 79x |
-| Depth-3 search | — | 4,954 ms | — |
-| Random game (500 moves) | ~14 s | 29 ms | 500x |
+Measured on the development machine with the release-mode benchmarks
+(`cargo run --release --example bench_nps` and `--example bench_fixed`).
+
+| Metric | Value |
+|---|---|
+| Legal moves from the initial position | 512 |
+| Move generation (`legal_moves`) | ~0.73 ms |
+| Static evaluation (`evaluate`) | ~51 µs |
+| `apply` + `undo` round trip | ~49 µs |
+| Perft(2) | 260,975 nodes @ ~1.09 M nodes/s |
+| Fixed-depth search — depth 4 | ~0.57 s (~175 k nodes/s) |
+| Fixed-depth search — depth 5 | ~1.4 s (~195 k nodes/s) |
+| Fixed-depth search — depth 6 | ~2.4 s (~205 k nodes/s) |
+
+The search (`src/search.rs`) uses iterative deepening with aspiration
+windows, principal-variation search (PVS), a transposition table with
+lock-free concurrent access, killer / counter / history move ordering,
+null-move pruning, razoring / reverse-futility / futility / ProbCut
+pruning, staged move generation and quiescence search. At depth ≥ 4,
+Lazy SMP parallelism spawns up to 3 helper threads.
+
+## Neural Evaluation (NNUE)
+
+An experimental neural-network evaluator (`src/eval/nnue.rs`,
+HalfKP-style features) can be enabled at runtime with
+`taikyokushogi::set_use_nnue(true)`; the weights are loaded from the path
+in the `TAIKYOKU_NNUE_PATH` environment variable. Run the `toggle_nnue`
+example for a smoke test.
+
+The full PyTorch training pipeline — generating data with `selfplay`,
+feature extraction, training, and exporting `.nnue` files — lives in
+[training/](training/README.md).
 
 ## Using as a Rust Crate
 
@@ -167,28 +235,43 @@ use taikyokushogi::{Board, Color};
 
 let mut board = Board::initial();
 let moves = board.legal_moves();
-println!("{} legal moves", moves.len());
+println!("{} legal moves", moves.len()); // 512
 
 board.apply(&moves[0]);
 println!("Score: {}", board.material_score());
 board.undo();
 
-// Search
+// Search: depth + time limit in ms (0 = no limit)
 let result = board.search(2, 5000);
 if let Some(mv) = result.best_move {
     println!("Best: {}, score: {}", mv, result.score);
 }
 
-// Piece info
+// TSFEN notation (the "FEN" of Taikyoku Shogi)
+let fen = board.to_tsfen();
+let restored = Board::from_tsfen(fen).unwrap();
+
+// Piece metadata
 let info = taikyokushogi::piece_info("LN").unwrap();
-println!("{}: {} (area={}, igui={})", info.name, info.value, info.area_steps, info.has_igui);
+println!("{}: value={} area={} igui={}",
+         info.name, info.value, info.area_steps, info.has_igui);
+
+// Switch between the hand-crafted and the NNUE evaluator
+// (requires a trained .nnue file — see training/README.md)
+// taikyokushogi::set_use_nnue(true);
 ```
+
+## Cargo Features
+
+- `cpu` (default) — pure-CPU engine
+- `gpu-cuda`, `gpu-metal`, `gpu-wgpu`, `gpu-vulkan` — GPU evaluation via `burn`
+- `nnue` — enables the NNUE evaluator (`burn` + `ndarray`)
 
 ## Credits and copyright
 
-This is a *fork* of **[taikyokushogi](https://github.com/jh85/taikyokushogi)** a complate engine for Taikyoku Shogi originally developed by **[jh85](https://github.com/jh85)**. 
+This is a *fork* of **[taikyokushogi](https://github.com/jh85/taikyokushogi)**, a complete engine for Taikyoku Shogi originally developed by **[jh85](https://github.com/jh85)**.
 
-The original base code is set with [MIT License](LICENSE). We thanks the original author for his excelent work in the optimization and logic of the 36x36 board in Rust.
+The original base code is released under the [MIT License](LICENSE). We thank the original author for his excellent work on the optimization and logic of the 36×36 board in Rust.
 
 ## References
 
