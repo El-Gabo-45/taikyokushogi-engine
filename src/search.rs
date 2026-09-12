@@ -780,10 +780,12 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         if idx == usize::MAX { break; }
         cap_scores[idx] = i32::MIN;
         let packed = m_pack(&cap_moves[idx]);
-        // 0-based index of the move being tried this iteration — identical to
-        // the old for-loop's enumerate() counter (advanced even on `continue`).
+        // 0-based index counting LEGAL captures searched so far. Illegal
+        // pseudo-legal captures (verified below) never consume a beam slot:
+        // move_idx previously advanced before the legality filter, so the
+        // first illegal captures could exhaust rps_beam without a single
+        // valid move being searched. The increment happens after the filter.
         let cur_move = move_idx;
-        move_idx += 1;
         if cur_move >= rps_beam && !in_check && searched {
             break;
         }
@@ -810,8 +812,9 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         board.apply_move(m);
         if (is_king_move || in_check) && is_in_check(board) {
             board.undo_move();
-            continue;
+            continue; // illegal — does NOT consume a beam slot
         }
+        move_idx += 1; // legal — consume a beam slot NOW, before the search
         searched = true;
         let new_d = d.saturating_sub(1);
         let score = if cur_move == 0 {
@@ -873,14 +876,19 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         }
 
-        for (move_idx, &(order_score, idx, packed)) in scored.iter().enumerate() {
-            if move_idx >= rps_beam && !in_check && searched {
+        for &(order_score, idx, packed) in scored.iter() {
+            // cur_move = count of LEGAL quiets searched so far. Illegal
+            // pseudo-legal quiets (verified below) never consume a beam
+            // slot — the increment happens after the legality filter, so
+            // rps_beam is spent exclusively on valid moves.
+            let cur_move = move_idx;
+            if cur_move >= rps_beam && !in_check && searched {
                 break;
             }
-            if move_idx > 0 {
+            if cur_move > 0 {
                 if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
             }
-            if pruning && d <= 2 && move_idx >= beam && order_score < 1_000_000
+            if pruning && d <= 2 && cur_move >= beam && order_score < 1_000_000
                 && alpha > -MATE_SCORE + 100
             {
                 continue;
@@ -890,12 +898,12 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             // small margin; if even that margin cannot reach alpha, skip the
             // move entirely (avoids apply + is_in_check + subtree on the
             // hundreds of remaining quiets at each node).
-            if pruning && d <= 2 && !in_check && move_idx > 0
+            if pruning && d <= 2 && !in_check && cur_move > 0
                 && order_score < 1_000_000 && alpha > -MATE_SCORE + 100
             {
                 if static_eval + 120 * d as i32 + 60 <= alpha { continue; }
             }
-            if move_idx > 0 {
+            if cur_move > 0 {
                 if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
             }
             let m = &moves[idx];
@@ -904,8 +912,9 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             board.apply_move(m);
             if (is_king_move || in_check) && is_in_check(board) {
                 board.undo_move();
-                continue;
+                continue; // illegal — does NOT consume a beam slot
             }
+            move_idx += 1; // legal — consume a beam slot NOW, before the search
             searched = true;
             if order_score < 1_000_000 {
                 if quiet_tried_n < quiet_tried.len() {
@@ -914,17 +923,21 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
                 }
             }
             let singular_ext = pruning && d >= 6 && !in_check && tt_move != 0 && packed == tt_move && order_score < 1_000_000;
-            let reduction = if pruning && move_idx >= 3 && d >= 3
+            let reduction = if pruning && cur_move >= 3 && d >= 3
                 && order_score < 1_000_000 && !in_check
             {
-                let base = (move_idx / 3).min(3) as u32;
+                let base = (cur_move / 3).min(3) as u32;
                 let depth_factor = (d / 3).min(2);
-                base + depth_factor
+                // A quiet with a strong history is statistically good —
+                // soften its reduction so it is not searched too shallowly
+                // (LMR + history interaction, standard in modern engines).
+                let soften = (history_score(m.from_sq as usize, m.to_sq as usize) / 8_000).min(2) as u32;
+                (base + depth_factor).saturating_sub(soften)
             } else { 0 };
             let mut new_d = d.saturating_sub(1 + reduction);
             if singular_ext { new_d = new_d.saturating_add(1); }
             let score;
-            if move_idx == 0 {
+            if cur_move == 0 {
                 score = -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed);
             } else if reduction > 0 {
                 let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, pruning, packed);
@@ -957,12 +970,18 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     }
 
     // ── TT STORE ──────────────────────────────────────────────
-    if best_packed != 0 {
+    // Store whenever real moves were searched — including all-moves-fail-low
+    // nodes (valid UPPERBOUND entries). Skipping those used to waste TT
+    // probes on positions the tree reaches repeatedly via transpositions.
+    if searched {
         tt_store(hash, TTEntry {
             score: alpha,
             depth: d as i8,
             flag: if alpha <= init_alpha { 2 } else { tt_flag },
-            generation: 0,
+            // Coherence: tt_pack overrides this field with the ACTIVE
+            // generation, so a hardcoded 0 had no packed effect — but an
+            // inspected struct must not lie. Set the real generation.
+            generation: tt_gen(),
             best_move: best_packed,
             in_check,
         });
@@ -1071,9 +1090,15 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
             score: alpha,
             depth: 0,
             flag: if alpha <= init_q_alpha { 2 } else { 0 },
-            generation: 0,
+            generation: tt_gen(),
             best_move: 0,
-            in_check: false,
+            // CRITICAL FIX: this was hardcoded `false`, but pvs TRUSTS the
+            // TT's in_check flag on any hit (to skip is_in_check and to gate
+            // the check extension + null-move + razoring/RFP pruning). A
+            // QS-stored entry claiming "not in check" for a position that
+            // IS in check silently disabled the check extension and enabled
+            // pruning inside check — invalidating tactical accuracy.
+            in_check: is_in_check(board),
         });
     }
     alpha
