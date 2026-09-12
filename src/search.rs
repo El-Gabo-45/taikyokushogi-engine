@@ -69,9 +69,17 @@ fn tt_probe(hash: u64) -> Option<(TTEntry, u32)> {
     let t = tt();
     for i in 0..TT_BUCKET_WIDTH {
         let idx = base + i * 2;
-        let stored = t[idx].load(Ordering::Relaxed);
+        // ── Race-safe read ────────────────────────────────────────
+        // Hash and data live in separate AtomicU64 slots. A concurrent writer
+        // could publish a new hash between our two loads. Read with Acquire,
+        // snapshot the data, then RE-VERIFY the hash: if it changed, the slot
+        // was overwritten mid-read and we treat it as a miss.
+        let stored = t[idx].load(Ordering::Acquire);
         if stored == hash {
-            let entry = tt_unpack(t[idx + 1].load(Ordering::Relaxed));
+            let entry = tt_unpack(t[idx + 1].load(Ordering::Acquire));
+            if t[idx].load(Ordering::Acquire) != stored {
+                continue; // slot overwritten mid-read — try next bucket slot
+            }
             if entry.depth >= 0 { return Some((entry, entry.best_move)); }
         }
     }
@@ -100,8 +108,12 @@ fn tt_store(hash: u64, entry: TTEntry) {
         }
     }
 
-    t[replace_idx].store(hash, Ordering::Relaxed);
-    t[replace_idx + 1].store(tt_pack(&entry, gen), Ordering::Relaxed);
+    // ── Race-safe write ─────────────────────────────────────────
+    // Publish data BEFORE the hash, both with Release: a reader that observes
+    // the hash (Acquire) is guaranteed to see at least this data snapshot,
+    // never a torn mix of old and new entries.
+    t[replace_idx + 1].store(tt_pack(&entry, gen), Ordering::Release);
+    t[replace_idx].store(hash, Ordering::Release);
 }
 
 // ── Killers ─────────────────────────────────────────────────────
@@ -469,6 +481,7 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
     let mut total_nodes: u64 = 0;
     let mut root_hint: Option<u32> = None;
     let mut score_guess = best_result.score;
+    let mut prev_iter_ms: u64 = 0;
 
     if depth == 0 {
         return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
@@ -480,17 +493,16 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
         }
 
         // ── PREDICTIVE TIME MANAGEMENT ────────────────────────
-        // The next iteration typically costs 3-5x the previous one (branching
-        // factor). If the elapsed time is already more than ~45% of the
-        // budget, the next iteration cannot possibly finish — stop here and
-        // keep the last completed iteration's result instead of burning the
-        // remaining time on an unusable partial score. (Classic technique:
-        // predict iteration cost from the previous one, e.g. Stockfish.)
-        if current_depth >= 2 {
-            if deadline.is_some() {
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                if elapsed_ms.saturating_mul(20) >= time_limit_ms.saturating_mul(9) { break; }
-            }
+        // The next iteration typically costs ~4x the previous one (branching
+        // factor). If the last completed iteration's duration times 4 no
+        // longer fits in the remaining budget, stop — starting it would burn
+        // the rest of the time on an unusable partial result. (Standard
+        // technique: predict the next iteration's cost from the previous
+        // one, as in Stockfish.)
+        if current_depth >= 2 && deadline.is_some() && prev_iter_ms > 0 {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let remaining = time_limit_ms.saturating_sub(elapsed_ms);
+            if prev_iter_ms.saturating_mul(4) > remaining { break; }
         }
 
         let result = if current_depth <= 1 {
@@ -498,11 +510,15 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
         } else {
             // Aspiration windows at ALL depths >= 2. The previous version
             // disabled them for d >= 5 because a *narrow* (±64) window failed
-            // constantly on this game's volatile scores, causing many
-            // expensive re-searches. A wider initial window (±200) plus
-            // geometric growth (×4) fails rarely while still shrinking the
-            // root search cost when the score is stable.
+            // constantly on this game's volatile scores (the eval can jump
+            // thousands of centipawns between iterations when a large capture
+            // is found), causing long cascades of re-searches. Policy:
+            // initial window ±64 (±200 at d >= 5); on the FIRST fail grow ×8;
+            // on the SECOND fail fall back to the FULL window. At most two
+            // re-searches per iteration, and each failed re-search is much
+            // cheaper than a full-window search thanks to TT hits.
             let mut window = if current_depth <= 4 { 64i32 } else { 200i32 };
+            let mut fails = 0u8;
             let mut alpha = score_guess.saturating_sub(window);
             let mut beta = score_guess.saturating_add(window);
             let mut local_result;
@@ -512,7 +528,17 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
                     if Instant::now() >= dl { break; }
                 }
                 if local_result.score <= alpha || local_result.score >= beta {
-                    window = (window * 4).min(8192);
+                    fails += 1;
+                    if fails >= 2 {
+                        break; // keep the (bounded) result — full re-search not worth it
+                    }
+                    window = (window * 8).min(MATE_SCORE);
+                    if local_result.score <= alpha {
+                        // Fail low: the true score is LOWER than guessed —
+                        // recenter the window on the failed score so the next
+                        // search is bounded around the right region.
+                        score_guess = local_result.score;
+                    }
                     alpha = score_guess.saturating_sub(window);
                     beta = score_guess.saturating_add(window);
                     continue;
@@ -524,8 +550,12 @@ pub fn search(board: &mut Board, depth: u32, time_limit_ms: u64) -> SearchResult
 
         if deadline.map(|dl| Instant::now() >= dl).unwrap_or(false) { break; }
         total_nodes = total_nodes.saturating_add(result.nodes);
+        if std::env::var("RPS_DEBUG").is_ok() {
+            eprintln!("iter d={} nodes={} score={} t={}ms", current_depth, result.nodes, result.score, result.time_ms);
+        }
         root_hint = result.best_move.as_ref().map(m_pack);
         score_guess = result.score;
+        prev_iter_ms = result.time_ms;
         best_result = result;
     }
 
@@ -689,7 +719,10 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     let init_alpha = alpha;
     let mut searched = false;
     // Quiets tried so far at this node (for history malus on beta cutoff).
-    let mut quiet_tried: Vec<(usize, usize)> = Vec::new();
+    // Fixed stack array: at most rps_beam+1 quiets are ever tried before the
+    // beam break, so 64 slots always suffice — no heap allocation per node.
+    let mut quiet_tried: [(u16, u16); 64] = [(0, 0); 64];
+    let mut quiet_tried_n = 0usize;
 
     // Stage 1: captures + promotions (tactical moves).
     // Use the bitboard attack generator (O(attacked squares) for non-sliding
@@ -701,21 +734,39 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     } else {
         cap_moves
     };
-    let mut cap_scored: Vec<(i32, usize, u32)> = Vec::with_capacity(cap_moves.len());
-    for (i, m) in cap_moves.iter().enumerate() {
+    // ── Incremental move selection (pick-next) ────────────────────
+    // The old path built a tuple Vec and FULLY sorted the capture list at
+    // every node even though only `rps_beam` (6-24) moves are ever tried.
+    // We score once into a flat i32 buffer and repeatedly select the best
+    // remaining move (selection over the consumed prefix only): O(k·n) with
+    // k ≈ 6-24, no tuple boxing, and no full O(n log n) sort per node.
+    let mut cap_scores: Vec<i32> = Vec::with_capacity(cap_moves.len());
+    for m in cap_moves.iter() {
         let packed = m_pack(m);
         let hist = history_score(m.from_sq as usize, m.to_sq as usize);
         let cntr = counter_score(prev_move, packed);
-        let s = score_move(m, iid_move, hist, cntr, d);
-        cap_scored.push((s, i, packed));
+        cap_scores.push(score_move(m, iid_move, hist, cntr, d));
     }
-    cap_scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
-    for (move_idx, &(order_score, idx, packed)) in cap_scored.iter().enumerate() {
-        if move_idx >= rps_beam && !in_check && searched {
+    let mut move_idx = 0usize;
+    loop {
+        // Pick the best remaining capture.
+        let mut idx = usize::MAX;
+        let mut order_score = i32::MIN;
+        for (i, &s) in cap_scores.iter().enumerate() {
+            if s > order_score { order_score = s; idx = i; }
+        }
+        if idx == usize::MAX { break; }
+        cap_scores[idx] = i32::MIN;
+        let packed = m_pack(&cap_moves[idx]);
+        // 0-based index of the move being tried this iteration — identical to
+        // the old for-loop's enumerate() counter (advanced even on `continue`).
+        let cur_move = move_idx;
+        move_idx += 1;
+        if cur_move >= rps_beam && !in_check && searched {
             break;
         }
-        if move_idx > 0 {
+        if cur_move > 0 {
             if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
         }
         let m = &cap_moves[idx];
@@ -725,7 +776,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         // cannot possibly raise the score. With ~700 legal moves per node on
         // a 36×36 board, dropping hopeless captures cheaply (O(1) estimate)
         // is a large win — we avoid the full apply + is_in_check + search.
-        if pruning && d <= 2 && !in_check && move_idx > 0
+        if pruning && d <= 2 && !in_check && cur_move > 0
             && order_score < 1_000_000 && alpha > -MATE_SCORE + 100
         {
             let values = piece_vals();
@@ -742,7 +793,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         }
         searched = true;
         let new_d = d.saturating_sub(1);
-        let score = if move_idx == 0 {
+        let score = if cur_move == 0 {
             -pvs(board, new_d, -beta, -alpha, nodes, deadline, ply + 1, pruning, packed)
         } else {
             let nw = -pvs(board, new_d, -alpha - 1, -alpha, nodes, deadline, ply + 1, pruning, packed);
@@ -766,8 +817,8 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             // History gravity: penalize the quiets that failed to cause a
             // cutoff, so next time the cutting move (and similar ones) are
             // tried first. (Standard technique: Stockfish's history malus.)
-            for &(hf, ht) in quiet_tried.iter() {
-                history_malus(hf, ht, d);
+            for &(hf, ht) in &quiet_tried[..quiet_tried_n] {
+                history_malus(hf as usize, ht as usize, d);
             }
             break;
         }
@@ -836,7 +887,10 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             }
             searched = true;
             if order_score < 1_000_000 {
-                quiet_tried.push((m.from_sq as usize, m.to_sq as usize));
+                if quiet_tried_n < quiet_tried.len() {
+                    quiet_tried[quiet_tried_n] = (m.from_sq, m.to_sq);
+                    quiet_tried_n += 1;
+                }
             }
             let singular_ext = pruning && d >= 6 && !in_check && tt_move != 0 && packed == tt_move && order_score < 1_000_000;
             let reduction = if pruning && move_idx >= 3 && d >= 3
