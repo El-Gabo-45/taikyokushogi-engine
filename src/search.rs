@@ -275,29 +275,45 @@ fn search_root_window(
         if moves.is_empty() {
             return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
         }
+        let in_check = is_in_check(board);
         let mut best_move = None;
         let mut best_score = -MATE_SCORE - 1;
         let mut nodes: u64 = 0;
         let base_mat = material_score(board);
+        let sign = if board.side_to_move == BLACK { 1 } else { -1 };
+        let values = piece_vals();
         for m in &moves {
             nodes += 1;
+            // ── LEGALITY FILTER (was completely missing) ──────────
+            // The pure material-delta shortcut scored pseudo-legal moves
+            // that leave our own royal attacked — kings stepping into
+            // attack, pinned sliders moving off the pin — with full
+            // material gain, badly misleading the tree (a depth-3 "mate"
+            // against an illegal reply). Verify with apply + is_in_check +
+            // undo; it is only ~µs per move with the bitboard checker.
+            board.apply_move(m);
+            let illegal = is_in_check(board);
+            board.undo_move();
+            if illegal { continue; }
             let mut delta = 0i32;
-            let sign = if board.side_to_move == BLACK { 1 } else { -1 };
             if m.promotion {
                 let pt = cell_piece(board.cells[m.from_sq as usize]);
                 if let Some(p) = pieces::promotes_to(pt) {
-                    let v = piece_vals();
-                    delta += sign * (v[p as usize] - v[pt as usize]);
+                    delta += sign * (values[p as usize] - values[pt as usize]);
                 }
             }
-            let v = piece_vals();
-            if m.captured_piece != 0 { delta += sign * v[m.captured_piece as usize]; }
-            if m.mid_piece != 0 { delta += sign * v[m.mid_piece as usize]; }
+            if m.captured_piece != 0 { delta += sign * values[m.captured_piece as usize]; }
+            if m.mid_piece != 0 { delta += sign * values[m.mid_piece as usize]; }
             if let Some(ref caps) = m.range_caps {
-                for &(_, pt, _) in caps.iter() { delta += sign * v[pt as usize]; }
+                for &(_, pt, _) in caps.iter() { delta += sign * values[pt as usize]; }
             }
             let s = -(base_mat + delta);
             if s > best_score { best_score = s; best_move = Some(m.clone()); }
+        }
+        // No legal move at all: checkmate if in check, else stalemate-like 0.
+        if best_move.is_none() {
+            let score = if in_check { -(MATE_SCORE - depth as i32) } else { 0 };
+            return SearchResult { best_move: None, score, nodes, time_ms: start.elapsed().as_millis() as u64 };
         }
         return SearchResult { best_move, score: best_score, nodes, time_ms: start.elapsed().as_millis() as u64 };
     }
@@ -714,7 +730,12 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // when a capture already causes a cutoff — the dominant cost of deep
     // search. Reference: docx §3.2 Futility Pruning & §4.4 Quiescence.
     let rps_beam = if d <= 2 { 24 } else if d <= 4 { 12 } else { 6 };
-    let mut best: Option<Move> = None;
+    // ── BEST MOVE AS SCALAR ───────────────────────────────────
+    // Track the best move as its packed u32 instead of a cloned Move.
+    // Move contains an Option<Rc<Vec<...>>> (range_caps) plus 12 fields;
+    // cloning it on every alpha raise trashes L1/L2 for data we only need
+    // to store into the TT as a u32 anyway. (Recommendation: pack to scalar.)
+    let mut best_packed: u32 = 0;
     let mut tt_flag: u8 = 2; // UPPERBOUND
     let init_alpha = alpha;
     let mut searched = false;
@@ -805,7 +826,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         if score > alpha {
             alpha = score;
             tt_flag = 0;
-            best = Some(m.clone());
+            best_packed = packed;
         }
         if alpha >= beta {
             tt_flag = 1;
@@ -921,7 +942,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             if score > alpha {
                 alpha = score;
                 tt_flag = 0;
-                best = Some(m.clone());
+                best_packed = packed;
             }
             if alpha >= beta {
                 tt_flag = 1;
@@ -936,13 +957,13 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     }
 
     // ── TT STORE ──────────────────────────────────────────────
-    if let Some(bm) = &best {
+    if best_packed != 0 {
         tt_store(hash, TTEntry {
             score: alpha,
             depth: d as i8,
             flag: if alpha <= init_alpha { 2 } else { tt_flag },
             generation: 0,
-            best_move: m_pack(bm),
+            best_move: best_packed,
             in_check,
         });
     }
