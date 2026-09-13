@@ -98,10 +98,15 @@ pub fn generate_pseudo_legal_moves(board: &Board) -> Vec<Move> {
     moves
 }
 
-/// Generate legal moves (slower: filters pseudo-legal moves for legality).
+/// Generate legal moves.
+///
+/// Taikyoku Shogi has NO check (SPEC §7.3): a move is legal iff it follows
+/// the piece's movement atoms. There is nothing to filter — the previous
+/// version dropped any move that left the royals "in check", which is a
+/// concept that does not exist in this variant and silently hid valid
+/// moves, including winning royal captures.
 pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
-    let pseudo = generate_pseudo_legal_moves(board);
-    filter_legal_moves(board, pseudo)
+    generate_pseudo_legal_moves(board)
 }
 
 /// Generate pseudo-legal capture/promotion moves only (fast).
@@ -278,21 +283,6 @@ fn gen_area_captures(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
             }
         }
     }
-}
-
-fn filter_legal_moves(board: &Board, mut moves: Vec<Move>) -> Vec<Move> {
-    let mut legal_moves = Vec::with_capacity(moves.len());
-    let mut board_copy = board.clone_without_history();
-
-    for m in moves.drain(..) {
-        board_copy.apply_move(&m);
-        if !is_in_check(&board_copy) {
-            legal_moves.push(m);
-        }
-        board_copy.undo_move();
-    }
-
-    legal_moves
 }
 
 /// Public check-detection entry point.

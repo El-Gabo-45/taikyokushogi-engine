@@ -84,16 +84,22 @@ pub fn feature_index(king_sq: usize, piece_sq: usize, piece_type: u16, color: u8
 
 #[derive(Clone, Debug)]
 pub struct Accumulator {
-    /// Accumulated values for the current perspective (FT_NEURONS)
-    pub white: Vec<i16>,
-    pub black: Vec<i16>,
+    /// Accumulated values for the current perspective (FT_NEURONS).
+    ///
+    /// i32, NOT i16: with up to 804 active features on a 36x36 board the
+    /// worst-case sum is 804 * 32_767 + 8_191 = 26.4M, far beyond i16 but
+    /// still 81x inside i32. An i16 accumulator saturates constantly and
+    /// turns every neuron into a flat 255 after the clipped ReLU (the exact
+    /// failure ADR-008 of TaikyokuShogi-Stockfish diagnoses).
+    pub white: Vec<i32>,
+    pub black: Vec<i32>,
 }
 
 impl Accumulator {
     pub fn new() -> Self {
         Accumulator {
-            white: vec![0i16; FT_NEURONS],
-            black: vec![0i16; FT_NEURONS],
+            white: vec![0i32; FT_NEURONS],
+            black: vec![0i32; FT_NEURONS],
         }
     }
 
@@ -120,8 +126,8 @@ impl Accumulator {
                 
                 // Add feature weights to accumulators
                 for n in 0..FT_NEURONS {
-                    self.white[n] = self.white[n].saturating_add(ft.weights[idx_white][n]);
-                    self.black[n] = self.black[n].saturating_add(ft.weights[idx_black][n]);
+                    self.white[n] = self.white[n].saturating_add(ft.weights[idx_white][n] as i32);
+                    self.black[n] = self.black[n].saturating_add(ft.weights[idx_black][n] as i32);
                 }
             }
         }
@@ -137,13 +143,13 @@ impl Accumulator {
         if king_sq_white < NUM_SQUARES {
             let old_idx = feature_index(king_sq_white, from, pt, color, WHITE);
             for n in 0..FT_NEURONS {
-                self.white[n] = self.white[n].saturating_sub(ft.weights[old_idx][n]);
+                self.white[n] = self.white[n].saturating_sub(ft.weights[old_idx][n] as i32);
             }
         }
         if king_sq_black < NUM_SQUARES {
             let old_idx = feature_index(king_sq_black, from, pt, color, BLACK);
             for n in 0..FT_NEURONS {
-                self.black[n] = self.black[n].saturating_sub(ft.weights[old_idx][n]);
+                self.black[n] = self.black[n].saturating_sub(ft.weights[old_idx][n] as i32);
             }
         }
         
@@ -151,13 +157,13 @@ impl Accumulator {
         if king_sq_white < NUM_SQUARES {
             let new_idx = feature_index(king_sq_white, to, pt, color, WHITE);
             for n in 0..FT_NEURONS {
-                self.white[n] = self.white[n].saturating_add(ft.weights[new_idx][n]);
+                self.white[n] = self.white[n].saturating_add(ft.weights[new_idx][n] as i32);
             }
         }
         if king_sq_black < NUM_SQUARES {
             let new_idx = feature_index(king_sq_black, to, pt, color, BLACK);
             for n in 0..FT_NEURONS {
-                self.black[n] = self.black[n].saturating_add(ft.weights[new_idx][n]);
+                self.black[n] = self.black[n].saturating_add(ft.weights[new_idx][n] as i32);
             }
         }
         
@@ -166,13 +172,13 @@ impl Accumulator {
             if king_sq_white < NUM_SQUARES {
                 let cap_idx = feature_index(king_sq_white, to, captured_pt, captured_color, WHITE);
                 for n in 0..FT_NEURONS {
-                    self.white[n] = self.white[n].saturating_sub(ft.weights[cap_idx][n]);
+                    self.white[n] = self.white[n].saturating_sub(ft.weights[cap_idx][n] as i32);
                 }
             }
             if king_sq_black < NUM_SQUARES {
                 let cap_idx = feature_index(king_sq_black, to, captured_pt, captured_color, BLACK);
                 for n in 0..FT_NEURONS {
-                    self.black[n] = self.black[n].saturating_sub(ft.weights[cap_idx][n]);
+                    self.black[n] = self.black[n].saturating_sub(ft.weights[cap_idx][n] as i32);
                 }
             }
         }

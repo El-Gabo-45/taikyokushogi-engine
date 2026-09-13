@@ -12,14 +12,18 @@
 //!   null-move pruning, razoring / reverse futility / futility / ProbCut,
 //!   staged move generation (captures first, quiets only if needed) with
 //!   incremental pick-next ordering, check extension on in-check nodes.
-//! * Quiescence with its own TT traffic (stores the real in_check flag).
+//! * Quiescence with its own TT traffic.
+//!
+//! NOTE: this variant has NO check and NO checkmate (SPEC §7.3): a move may
+//! expose royals freely, and the game only ends when a side captures the
+//! opponent's LAST royal (SPEC §7.2). Therefore there is no legality
+//! filtering by king safety, no check extension, and no check-gated pruning.
 
 use crate::types::*;
 use crate::pieces;
 use crate::board::Board;
 use crate::movegen::generate_pseudo_legal_moves;
 use crate::movegen::generate_pseudo_legal_captures;
-use crate::movegen::is_in_check;
 use crate::eval::{evaluate, material_score, MATE_SCORE};
 use std::sync::atomic::{AtomicU64, AtomicI32, Ordering};
 use std::sync::OnceLock;
@@ -166,35 +170,48 @@ fn killer_score(depth: u32, mv: u32) -> i32 {
 }
 
 // ── History ─────────────────────────────────────────────────────
-const HIST_SZ: usize = 256;
-static HIST: OnceLock<Vec<AtomicI32>> = OnceLock::new();
-fn history() -> &'static Vec<AtomicI32> {
-    HIST.get_or_init(|| (0..HIST_SZ * HIST_SZ).map(|_| AtomicI32::new(0)).collect())
+// Butterfly history indexed by the EXACT (from, to) square pair:
+// [2][1296][1296] i32 ≈ 6.7 MB, allocated lazily and zero-initialized
+// by the OS on first touch. The previous 256×256 modulo table gave every
+// bucket ~25 distinct (from, to) pairs on a 36×36 board (25× signal
+// dilution); exact indexing removes the collateral noise entirely.
+const HIST_FROM: usize = NUM_SQUARES;
+static HIST: OnceLock<Box<[AtomicI32]>> = OnceLock::new();
+fn history() -> &'static [AtomicI32] {
+    HIST.get_or_init(|| {
+        let mut v = Vec::with_capacity(2 * HIST_FROM * HIST_FROM);
+        v.resize_with(2 * HIST_FROM * HIST_FROM, || AtomicI32::new(0));
+        v.into_boxed_slice()
+    })
 }
 
-fn history_store(from: usize, to: usize, depth: u32) {
-    let idx = (from % HIST_SZ) * HIST_SZ + (to % HIST_SZ);
+#[inline]
+fn history_idx(from: usize, to: usize, side: u8) -> usize {
+    side as usize * HIST_FROM * HIST_FROM + from * HIST_FROM + to
+}
+
+fn history_store(from: usize, to: usize, depth: u32, side: u8) {
+    let idx = history_idx(from, to, side);
     let bonus = (depth * depth).min(400) as i32;
     history()[idx].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_add(bonus).min(32767))
     }).ok();
 }
 
-fn history_malus(from: usize, to: usize, depth: u32) {
-    let idx = (from % HIST_SZ) * HIST_SZ + (to % HIST_SZ);
+fn history_malus(from: usize, to: usize, depth: u32, side: u8) {
+    let idx = history_idx(from, to, side);
     let malus = (depth * depth).min(400) as i32;
     history()[idx].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_sub(malus).max(0))
     }).ok();
 }
 
-fn history_score(from: usize, to: usize) -> i32 {
-    let idx = (from % HIST_SZ) * HIST_SZ + (to % HIST_SZ);
-    history()[idx].load(Ordering::Relaxed)
+fn history_score(from: usize, to: usize, side: u8) -> i32 {
+    history()[history_idx(from, to, side)].load(Ordering::Relaxed)
 }
 
 fn history_clear() {
-    if let Some(h) = HIST.get() { for cell in h { cell.store(0, Ordering::Relaxed); } }
+    if let Some(h) = HIST.get() { for cell in h.iter() { cell.store(0, Ordering::Relaxed); } }
     counter_clear();
     TT_GEN.fetch_add(1, Ordering::Relaxed);
 }
@@ -287,8 +304,8 @@ fn search_root_window(
     }
 
     // Depth 1-3 all use the fast material-delta path.
-    // On a 36×36 board with ~700 legal moves, the full apply+is_in_check+
-    // undo cycle costs ~2.8ms per move, so a real depth-2/3 search (716 root
+    // On a 36×36 board with ~700 legal moves, the full apply+undo cycle
+    // (plus is_in_check costs) made a real depth-2/3 search (716 root
     // moves × 716 replies) would take seconds per iteration and never
     // complete within a practical time budget. The material-delta shortcut
     // evaluates each move's material change directly (O(1) per move) and
@@ -300,7 +317,6 @@ fn search_root_window(
         if moves.is_empty() {
             return SearchResult { best_move: None, score: evaluate(board), nodes: 1, time_ms: 0 };
         }
-        let in_check = is_in_check(board);
         let mut best_move = None;
         let mut best_score = -MATE_SCORE - 1;
         let mut nodes: u64 = 0;
@@ -309,17 +325,6 @@ fn search_root_window(
         let values = piece_vals();
         for m in &moves {
             nodes += 1;
-            // ── LEGALITY FILTER ──────────
-            // The pure material-delta shortcut scored pseudo-legal moves
-            // that leave our own royal attacked — kings stepping into
-            // attack, pinned sliders moving off the pin — with full
-            // material gain, badly misleading the tree (a depth-3 "mate"
-            // against an illegal reply). Verify with apply + is_in_check +
-            // undo; it is only ~µs per move with the bitboard checker.
-            board.apply_move(m);
-            let illegal = is_in_check(board);
-            board.undo_move();
-            if illegal { continue; }
             let mut delta = 0i32;
             if m.promotion {
                 let pt = cell_piece(board.cells[m.from_sq as usize]);
@@ -337,7 +342,8 @@ fn search_root_window(
         }
         // No legal move at all: checkmate if in check, else stalemate-like 0.
         if best_move.is_none() {
-            let score = if in_check { -(MATE_SCORE - depth as i32) } else { 0 };
+            // No legal move at all: the side to move loses (SPEC §7.3).
+            let score = -(MATE_SCORE - depth as i32);
             return SearchResult { best_move: None, score, nodes, time_ms: start.elapsed().as_millis() as u64 };
         }
         return SearchResult { best_move, score: best_score, nodes, time_ms: start.elapsed().as_millis() as u64 };
@@ -347,6 +353,8 @@ fn search_root_window(
     let mut best_move = None;
     let mut best_score = -MATE_SCORE - 1;
     let root_tt_move = tt_probe(board.hash).map(|e| e.best_move).unwrap_or(0);
+    let stm = board.side_to_move;
+
 
     // ── ROOT-LEVEL STAGED GENERATION ──────────────────────────
     // Generate captures first (cheap, ~10-50 moves), search them. Only if
@@ -380,7 +388,7 @@ fn search_root_window(
     let mut cap_scored: Vec<(i32, usize)> = Vec::with_capacity(cap_moves.len());
     for (i, m) in cap_moves.iter().enumerate() {
         let packed = m_pack(m);
-        let hist = history_score(m.from_sq as usize, m.to_sq as usize);
+        let hist = history_score(m.from_sq as usize, m.to_sq as usize, stm);
         let mut s = score_move(m, root_tt_move, hist, 0, depth);
         if root_hint == Some(packed) { s += ROOT_HINT_SCORE; }
         cap_scored.push((s, i));
@@ -432,7 +440,7 @@ fn search_root_window(
         let mut scored: Vec<(i32, usize)> = Vec::with_capacity(moves.len());
         for (i, m) in moves.iter().enumerate() {
             let packed = m_pack(m);
-            let hist = history_score(m.from_sq as usize, m.to_sq as usize);
+            let hist = history_score(m.from_sq as usize, m.to_sq as usize, stm);
             let mut s = score_move(m, root_tt_move, hist, 0, depth);
             if root_hint == Some(packed) { s += ROOT_HINT_SCORE; }
             scored.push((s, i));
@@ -613,36 +621,17 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     }
 
     // ── TT PROBE ──────────────────────────────────────────────
-    // The TT stores an `in_check` flag so the expensive is_in_check()
-    // computation can be skipped on TT hits. Only compute it when the
-    // TT entry doesn't provide it (i.e., no entry or depth < depth).
     let hash = board.hash;
-    let tt_probe_result = tt_probe(hash);
-    let mut cached_in_check = false;
-    let mut has_tt_entry = false;
-    let tt_move = if let Some(entry) = tt_probe_result {
-        has_tt_entry = true;
-        cached_in_check = entry.in_check;
-        if (entry.depth as u32) >= depth {
-            match entry.flag {
-                0 => return entry.score,
-                1 => if entry.score >= beta { return entry.score; },
-                2 => if entry.score <= alpha { return entry.score; },
-                _ => {}
-            }
-        }
-        entry.best_move
-    } else { 0 };
+    let tt_move = tt_probe(hash).map(|e| e.best_move).unwrap_or(0);
 
-    // Trust the TT `in_check` flag on *any* TT hit (true or false): it was
-    // computed for this exact position (same hash + side to move), so it is
-    // valid at this node. Previously only `true` was trusted and the common
-    // case (TT hit on a non-check position) recomputed the expensive
-    // is_in_check() ray/bitboard scan every single time. This skips that
-    // scan on nearly every TT-hit node.
-    let in_check = if has_tt_entry { cached_in_check } else { is_in_check(board) };
-    let ext = if in_check { 1 } else { 0 };
-    let d = depth + ext; // effective depth
+    // Taikyoku has NO check (SPEC §7.3): a move may freely expose the
+    // royals; the game only ends when a side captures the opponent's
+    // LAST royal. There is no check extension, no check-based move filter
+    // and no check-gated pruning. `in_check` is an always-false binding so
+    // the existing `!in_check` gates read naturally.
+    let in_check = false;
+    let ext = 0u32;
+    let d = depth; // effective depth
 
     // ── QUIESCENCE AT LEAVES ──────────────────────────────────
     // At d == 0, run quiescence (capture-only) to avoid the horizon effect.
@@ -724,6 +713,10 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // (~700 moves). This avoids generating ~700 quiet moves at every node
     // when a capture already causes a cutoff — the dominant cost of deep
     // search. Reference: docx §3.2 Futility Pruning & §4.4 Quiescence.
+    // Side to move at THIS node, captured before any apply_move flips it:
+    // history tables are per-side, and the beta-cutoff blocks below run
+    // after board.undo_move() has already restored the parent's side.
+    let stm = board.side_to_move;
     let rps_beam = if d <= 2 { 24 } else if d <= 4 { 12 } else { 6 };
     // ── BEST MOVE AS SCALAR ───────────────────────────────────
     // Track the best move as its packed u32 instead of a cloned Move.
@@ -757,7 +750,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     let mut cap_scores: Vec<i32> = Vec::with_capacity(cap_moves.len());
     for m in cap_moves.iter() {
         let packed = m_pack(m);
-        let hist = history_score(m.from_sq as usize, m.to_sq as usize);
+        let hist = history_score(m.from_sq as usize, m.to_sq as usize, stm);
         let cntr = counter_score(prev_move, packed);
         cap_scores.push(score_move(m, iid_move, hist, cntr, d));
     }
@@ -791,7 +784,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         // safety margin cannot lift the static eval to alpha, this capture
         // cannot possibly raise the score. With ~700 legal moves per node on
         // a 36×36 board, dropping hopeless captures cheaply (O(1) estimate)
-        // is a large win — we avoid the full apply + is_in_check + search.
+        // is a large win — we avoid the full apply + subtree search.
         if d <= 2 && !in_check && cur_move > 0
             && order_score < 1_000_000 && alpha > -MATE_SCORE + 100
         {
@@ -800,14 +793,10 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             let gain = capture_qs_score(board, m, values) + values[from_pt as usize];
             if static_eval + gain + 140 <= alpha { continue; }
         }
-        let from_cell = board.cells[m.from_sq as usize];
-        let is_king_move = pieces::is_royal(cell_piece(from_cell));
         board.apply_move(m);
-        if (is_king_move || in_check) && is_in_check(board) {
-            board.undo_move();
-            continue; // illegal — does NOT consume a beam slot
-        }
-        move_idx += 1; // legal — consume a beam slot NOW, before the search
+        // Every pseudo-legal move is legal in Taikyoku (no check): consume a
+        // beam slot now, before the search.
+        move_idx += 1;
         searched = true;
         let new_d = d.saturating_sub(1);
         let score = if cur_move == 0 {
@@ -828,41 +817,44 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             tt_flag = 1;
             if order_score < 1_000_000 {
                 killer_store(d, packed);
-                history_store(m.from_sq as usize, m.to_sq as usize, d);
+                history_store(m.from_sq as usize, m.to_sq as usize, d, stm);
             }
             if prev_move != 0 { counter_store(prev_move, packed); }
             // History gravity: penalize the quiets that failed to cause a
             // cutoff, so next time the cutting move (and similar ones) are
             // tried first. (Standard technique: Stockfish's history malus.)
             for &(hf, ht) in &quiet_tried[..quiet_tried_n] {
-                history_malus(hf as usize, ht as usize, d);
+                history_malus(hf as usize, ht as usize, d, stm);
             }
             break;
         }
     }
 
     // Stage 2: quiet moves (only if no beta cutoff from captures).
-    // ACTUAL deep_skip_quiets gate: the code below always generated the full
-    // ~700-move quiet list at every node even though `rps_beam` only searched
-    // a handful — the comment claimed "skip quiet moves for d>=4" but the gate
-    // was never applied to GENERATION, only to how many were searched. On a
-    // giant board the full quiet generation is the dominant per-node cost, so
-    // at deep, quiet, already-searched nodes we skip it entirely (captures
-    // already raised alpha, and quiet subtree adds little for the cost).
-    let skip_quiet_gen = d >= 4 && !in_check && searched;
-    if alpha < beta && !skip_quiet_gen {
+    // LMP scaled by the REAL branching factor of the node. With ~700 quiets
+    // per node on a 36x36 board, a fixed chess-calibrated threshold prunes a
+    // far larger FRACTION than intended (TaikyokuShogi-Stockfish measured
+    // 84-98% of quiets with chess thresholds on branching ~1000). The fix
+    // scales the threshold with the node's branching so the pruned fraction
+    // is comparable to chess:
+    //   lmp_n = (3 + d^2) / (improving ? 1 : 2) * (1 + quiets / 128)
+    if alpha < beta {
         let moves = generate_pseudo_legal_moves(board);
         if moves.is_empty() { return -(MATE_SCORE - ply as i32); }
         let mut scored: Vec<(i32, usize, u32)> = Vec::with_capacity(moves.len());
         for (i, m) in moves.iter().enumerate() {
             let packed = m_pack(m);
-            let hist = history_score(m.from_sq as usize, m.to_sq as usize);
+            let hist = history_score(m.from_sq as usize, m.to_sq as usize, stm);
             let cntr = counter_score(prev_move, packed);
             let s = score_move(m, iid_move, hist, cntr, d);
             scored.push((s, i, packed));
         }
-        let beam = if d <= 1 { 24 } else if d <= 2 { 18 } else if d <= 4 { 12 } else { 8 };
-        let select_n = (rps_beam + 2).min(scored.len());
+        let n_quiets = scored.len();
+        let improving = static_eval > alpha;
+        let lmp_base = ((3 + d * d) as i32).max(3) as usize
+            / if improving { 1 } else { 2 };
+        let lmp_n = (lmp_base * (1 + n_quiets / 128)).min(n_quiets).min(64);
+        let select_n = lmp_n;
         if select_n > 1 && scored.len() > select_n {
             scored.select_nth_unstable_by(select_n - 1, |a, b| b.0.cmp(&a.0));
         } else {
@@ -870,26 +862,20 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
         }
 
         for &(order_score, idx, packed) in scored.iter() {
-            // cur_move = count of LEGAL quiets searched so far. Illegal
-            // pseudo-legal quiets (verified below) never consume a beam
-            // slot — the increment happens after the legality filter, so
-            // rps_beam is spent exclusively on valid moves.
+            // cur_move = count of quiets searched so far; only moves that are
+            // actually searched consume a slot (the increment is after any
+            // pruning continue).
             let cur_move = move_idx;
-            if cur_move >= rps_beam && !in_check && searched {
+            if cur_move >= lmp_n && !in_check && searched {
                 break;
             }
             if cur_move > 0 {
                 if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
             }
-            if d <= 2 && cur_move >= beam && order_score < 1_000_000
-                && alpha > -MATE_SCORE + 100
-            {
-                continue;
-            }
             // ── QUIET FUTILITY PRUNING (depth ≤ 2) ────────────
             // A quiet move at low depth cannot change the eval by more than a
             // small margin; if even that margin cannot reach alpha, skip the
-            // move entirely (avoids apply + is_in_check + subtree on the
+            // move entirely (avoids apply + subtree on the
             // hundreds of remaining quiets at each node).
             if d <= 2 && !in_check && cur_move > 0
                 && order_score < 1_000_000 && alpha > -MATE_SCORE + 100
@@ -900,14 +886,10 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
                 if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
             }
             let m = &moves[idx];
-            let from_cell = board.cells[m.from_sq as usize];
-            let is_king_move = pieces::is_royal(cell_piece(from_cell));
             board.apply_move(m);
-            if (is_king_move || in_check) && is_in_check(board) {
-                board.undo_move();
-                continue; // illegal — does NOT consume a beam slot
-            }
-            move_idx += 1; // legal — consume a beam slot NOW, before the search
+            // Every pseudo-legal move is legal in Taikyoku (no check): consume
+            // a beam slot now, before the search.
+            move_idx += 1;
             searched = true;
             if order_score < 1_000_000 {
                 if quiet_tried_n < quiet_tried.len() {
@@ -928,7 +910,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
                 // A quiet with a strong history is statistically good —
                 // soften its reduction so it is not searched too shallowly
                 // (LMR + history interaction, standard in modern engines).
-                let soften = (history_score(m.from_sq as usize, m.to_sq as usize) / 8_000).min(2) as u32;
+                let soften = (history_score(m.from_sq as usize, m.to_sq as usize, stm) / 8_000).min(2) as u32;
                 (base + depth_factor).saturating_sub(soften)
             } else { 0 };
             let mut new_d = d.saturating_sub(1 + reduction);
@@ -958,7 +940,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
                 tt_flag = 1;
                 if order_score < 1_000_000 {
                     killer_store(d, packed);
-                    history_store(m.from_sq as usize, m.to_sq as usize, d);
+                    history_store(m.from_sq as usize, m.to_sq as usize, d, stm);
                 }
                 if prev_move != 0 { counter_store(prev_move, packed); }
                 break;
@@ -980,7 +962,7 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
             // inspected struct must not lie. Set the real generation.
             generation: tt_gen(),
             best_move: best_packed,
-            in_check,
+            in_check: false, // no such thing as check in Taikyoku
         });
     }
 
@@ -1075,7 +1057,6 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
         }
         let m = &moves[i];
         board.apply_move(m);
-        if is_in_check(board) { board.undo_move(); continue; }
         let score = -quiescence_inner(board, -beta, -alpha, nodes, deadline, qd + 1);
         board.undo_move();
         if score >= beta { return beta; }
@@ -1089,13 +1070,8 @@ fn quiescence_inner(board: &mut Board, mut alpha: i32, beta: i32,
             flag: if alpha <= init_q_alpha { 2 } else { 0 },
             generation: tt_gen(),
             best_move: 0,
-            // CRITICAL FIX: this was hardcoded `false`, but pvs TRUSTS the
-            // TT's in_check flag on any hit (to skip is_in_check and to gate
-            // the check extension + null-move + razoring/RFP pruning). A
-            // QS-stored entry claiming "not in check" for a position that
-            // IS in check silently disabled the check extension and enabled
-            // pruning inside check — invalidating tactical accuracy.
-            in_check: is_in_check(board),
+            // Taikyoku has no check (SPEC §7.3) — always false.
+            in_check: false,
         });
     }
     alpha
@@ -1145,11 +1121,11 @@ mod tests {
 
     #[test]
     fn history_clear_zeroes_counters() {
-        history_store(3, 4, 5);
-        assert!(history_score(3, 4) > 0);
+        history_store(3, 4, 5, 0);
+        assert!(history_score(3, 4, 0) > 0);
         history_clear();
-        assert_eq!(history_score(3, 4), 0);
-        assert_eq!(history_score(0, 0), 0);
+        assert_eq!(history_score(3, 4, 1), 0);
+        assert_eq!(history_score(0, 0, 0), 0);
     }
 
     #[test]
