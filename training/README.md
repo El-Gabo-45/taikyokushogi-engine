@@ -19,20 +19,21 @@ weights to a binary format the Rust engine can load.
 - Toggling between the hand-crafted evaluator and NNUE at runtime
   (`taikyokushogi::set_use_nnue(true/false)`)
 
-**Known limitation -- NNUE is not yet wired for incremental accumulator
-updates:**
-`nnue_evaluate_from_scratch` (used when `set_use_nnue(true)` is active)
-rebuilds the Accumulator from scratch on every call -- O(pieces *
-FT_NEURONS), roughly 400,000 operations per call, since Taikyoku Shogi has
-up to ~400 pieces per side. Measured: **~1.8 seconds for a single
-`evaluate()` call**, vs ~58 microseconds for the hand-crafted evaluator --
-about 31,000x slower. This is fine for testing that the pipeline works
-end-to-end, but is NOT usable inside a real search (which calls evaluate()
-thousands of times per move). Real NNUE engines avoid this by updating the
-accumulator incrementally in `apply_move`/`undo_move` (add/remove only the
-features that changed, rather than recomputing all of them) -- that's real
-follow-up work, not done in this session, and worth doing before trying to
-actually play games with the trained network at any reasonable depth.
+**RESOLVED -- incremental accumulator updates are now wired in:**
+`Board::apply_move` maintains the NNUE `Accumulator` incrementally (add/remove
+only the features of pieces that moved or were captured, including range-capture
+intermediates, lion mid-captures and igui). When a royal anchor (`king_square`)
+changes, all HalfKP features become invalid, so it falls back to a full refresh
+for that move. `undo_move` restores the pre-move accumulator snapshot in O(1)
+via `UndoInfo::nnue_acc`. `eval::evaluate()` uses the maintained accumulator
+when available and only refreshes from scratch for boards with no applied
+moves. Correctness is enforced by the
+`eval::nnue::tests::incremental_accumulator_matches_refresh` test, which walks
+tactical lines asserting the incremental accumulator equals a from-scratch
+refresh at every position. This removes the historical ~1.8s-per-evaluate()
+bottleneck (~31,000x slower than the hand-crafted eval); NNUE is now usable
+inside the search when a trained `.nnue` file is provided via
+`TAIKYOKU_NNUE_PATH`.
 
 ## Pipeline overview
 
