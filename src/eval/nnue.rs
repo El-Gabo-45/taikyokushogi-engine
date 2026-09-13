@@ -133,6 +133,38 @@ impl Accumulator {
         }
     }
 
+    /// Incremental single-piece delta. MUST be consistent with `refresh`:
+    /// there, a piece of color X is indexed with the anchor of color X
+    /// (board.king_square(X)) into BOTH perspective accumulators. The
+    /// pre-existing `update_move` used the per-perspective anchor for every
+    /// piece, which diverged from `refresh` — these methods are the correct
+    /// primitive used by Board::apply_move. If an anchor changed, the caller
+    /// must do a full refresh instead of deltas.
+    pub fn remove_piece(&mut self, board: &Board, sq: usize, pt: u16, color: u8,
+                        ft: &FeatureTransformer) {
+        let anchor = board.king_square(color) as usize;
+        if anchor >= NUM_SQUARES { return; }
+        let idx_white = feature_index(anchor, sq, pt, color, WHITE);
+        let idx_black = feature_index(anchor, sq, pt, color, BLACK);
+        for n in 0..FT_NEURONS {
+            self.white[n] = self.white[n].saturating_sub(ft.weights[idx_white][n] as i32);
+            self.black[n] = self.black[n].saturating_sub(ft.weights[idx_black][n] as i32);
+        }
+    }
+
+    /// See `remove_piece`.
+    pub fn add_piece(&mut self, board: &Board, sq: usize, pt: u16, color: u8,
+                     ft: &FeatureTransformer) {
+        let anchor = board.king_square(color) as usize;
+        if anchor >= NUM_SQUARES { return; }
+        let idx_white = feature_index(anchor, sq, pt, color, WHITE);
+        let idx_black = feature_index(anchor, sq, pt, color, BLACK);
+        for n in 0..FT_NEURONS {
+            self.white[n] = self.white[n].saturating_add(ft.weights[idx_white][n] as i32);
+            self.black[n] = self.black[n].saturating_add(ft.weights[idx_black][n] as i32);
+        }
+    }
+
     /// Update accumulator when a piece moves (incremental)
     pub fn update_move(&mut self, board: &Board, from: usize, to: usize, pt: u16, color: u8,
                        captured_pt: u16, captured_color: u8, ft: &FeatureTransformer) {
@@ -634,6 +666,56 @@ mod tests {
     /// size) or a panic during evaluate() (out-of-bounds index from a
     /// shape mismatch that happened to produce a same-sized file, e.g. a
     /// transpose bug on a square-ish matrix).
+    #[test]
+    fn incremental_accumulator_matches_refresh() {
+        use crate::Board;
+        crate::eval::set_use_nnue(true);
+        let mut board = Board::initial();
+        let mut checked = 0usize;
+        for ply in 0..80usize {
+            // Oracle: an accumulator refreshed from scratch must equal the
+            // incrementally-maintained one at every position visited.
+            let mut fresh = Accumulator::new();
+            fresh.refresh(&board.inner, &nnue().ft);
+            if let Some(acc) = board.inner.nnue_acc.as_ref() {
+                assert_eq!(acc.white, fresh.white, "white acc diverged at ply {}", ply);
+                assert_eq!(acc.black, fresh.black, "black acc diverged at ply {}", ply);
+                checked += 1;
+            }
+            // Prefer tactical moves so captures/igui/promotions exercise the
+            // delta paths (including range-capture intermediates).
+            let moves = board.legal_moves();
+            if moves.is_empty() { break; }
+            let best = moves.iter().enumerate()
+                .max_by_key(|(_, m)| {
+                    let r = m.raw();
+                    (r.captured_piece != 0) as i32 * 4
+                        + (r.mid_piece != 0) as i32 * 2
+                        + (r.range_cap && r.caps_value != 0) as i32 * 3
+                        + r.promotion as i32
+                })
+                .map(|(i, _)| i)
+                .unwrap();
+            board.apply(&moves[(best + ply) % moves.len()]);
+            // Also exercise the undo snapshot restore path.
+            if ply % 7 == 3 {
+                let snapshot_acc = board.inner.nnue_acc.clone();
+                board.undo();
+                let mut fresh = Accumulator::new();
+                fresh.refresh(&board.inner, &nnue().ft);
+                if let Some(acc) = board.inner.nnue_acc.as_ref() {
+                    assert_eq!(acc.white, fresh.white, "acc after undo diverged at ply {}", ply);
+                    assert_eq!(acc.black, fresh.black, "acc after undo diverged at ply {}", ply);
+                }
+                assert_eq!(board.inner.nnue_acc.is_some(), snapshot_acc.is_some());
+                // re-apply to continue the walk
+                board.apply(&moves[(best + ply) % moves.len()]);
+            }
+        }
+        crate::eval::set_use_nnue(false);
+        assert!(checked > 10, "walk must have checked several positions");
+    }
+
     #[test]
     fn load_and_evaluate_exported_nnue() {
         let path = match std::env::var("TAIKYOKU_TEST_NNUE_PATH") {

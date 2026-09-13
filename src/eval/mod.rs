@@ -69,7 +69,13 @@ pub fn evaluate(board: &Board) -> i32 {
     }
 
     if USE_NNUE.load(Ordering::Relaxed) {
-        return nnue::nnue_evaluate_from_scratch(board);
+        // Use the incrementally-maintained accumulator when available
+        // (Board::apply_move keeps it in sync); fall back to a from-scratch
+        // refresh only for boards that never had a move applied to them.
+        return match &board.nnue_acc {
+            Some(acc) => nnue::nnue_evaluate(board, acc),
+            None => nnue::nnue_evaluate_from_scratch(board),
+        };
     }
 
     // Incremental PSQT score (combines material + family weight + zone

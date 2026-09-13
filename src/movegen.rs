@@ -10,6 +10,41 @@ const HOOK_TURN_SE: [usize; 2] = [NE, SW];
 const HOOK_TURN_SW: [usize; 2] = [SE, NW];
 const HOOK_TURN_NW: [usize; 2] = [NE, SW];
 
+use std::cell::RefCell;
+use std::collections::HashSet;
+
+thread_local! {
+    static DEDUP: RefCell<HashSet<u64>> = RefCell::new(HashSet::with_capacity(4096));
+}
+
+#[inline]
+fn effect_key(from: u16, to: u16, promo: bool, captured: u16,
+              mid: u16, mid_occupied: bool) -> u64 {
+    (from as u64)
+        | ((to as u64) << 11)
+        | ((promo as u64) << 22)
+        | ((captured as u64) << 23)
+        | ((mid_occupied as u64) << 32)
+        | (((mid as u64) & 0xFFF) << 33)
+}
+
+/// Clear the per-piece dedup set. Call once per moving piece before its
+/// generators run.
+pub fn dedup_begin() {
+    DEDUP.with(|d| d.borrow_mut().clear());
+}
+
+#[inline]
+pub fn push_unique(moves: &mut Vec<Move>, m: Move) {
+    let key = effect_key(m.from_sq, m.to_sq, m.promotion, m.captured_piece,
+                         m.mid_sq, m.mid_piece != 0);
+    DEDUP.with(|d| {
+        if d.borrow_mut().insert(key) {
+            moves.push(m);
+        }
+    });
+}
+
 // ── PRECOMPUTED JUMP DESTINATIONS ──────────────────────────────
 static JUMP_TABLE: OnceLock<Box<[[[[u16; 8]; 2]; NUM_SQUARES]; 512]>> = OnceLock::new();
 
@@ -67,6 +102,7 @@ pub fn generate_pseudo_legal_moves(board: &Board) -> Vec<Move> {
         let cell = board.cells[sq];
         if cell == EMPTY_CELL { continue; }
         let pt = cell_piece(cell);
+        dedup_begin();
         let tmpl = &t[(pt as usize).min(511)][color as usize];
 
         // Fast path: pure jumps/steps/slides/area/igui.
@@ -123,6 +159,7 @@ pub fn generate_pseudo_legal_captures(board: &Board) -> Vec<Move> {
         let cell = board.cells[sq];
         if cell == EMPTY_CELL { continue; }
         let pt = cell_piece(cell);
+        dedup_begin();
         let mv = pieces::movement(pt);
 
         gen_slides_captures(board, sq, pt, color, mv, rt, &mut moves);
@@ -539,11 +576,11 @@ fn add_move(moves: &mut Vec<Move>, from: u16, to: u16, pt: u16, color: u8, targe
     let cap_color = if target != EMPTY_CELL { cell_color(target) } else { 0 };
 
     if !can_promote(pt) {
-        moves.push(Move {
+        push_unique(moves, Move {
             from_sq: from, to_sq: to, promotion: false,
             captured_piece: captured, captured_color: cap_color,
             is_igui: false, mid_sq: INVALID_SQ, mid_piece: 0, mid_color: 0,
-            range_caps: None,
+            range_cap: false, caps_value: 0,
         });
         return;
     }
@@ -561,31 +598,31 @@ fn add_move(moves: &mut Vec<Move>, from: u16, to: u16, pt: u16, color: u8, targe
         && pieces::must_promote_at_far_rank(pt);
 
     if must_promote {
-        moves.push(Move {
+        push_unique(moves, Move {
             from_sq: from, to_sq: to, promotion: true,
             captured_piece: captured, captured_color: cap_color,
             is_igui: false, mid_sq: INVALID_SQ, mid_piece: 0, mid_color: 0,
-            range_caps: None,
+            range_cap: false, caps_value: 0,
         });
     } else if may_promote {
-        moves.push(Move {
+        push_unique(moves, Move {
             from_sq: from, to_sq: to, promotion: false,
             captured_piece: captured, captured_color: cap_color,
             is_igui: false, mid_sq: INVALID_SQ, mid_piece: 0, mid_color: 0,
-            range_caps: None,
+            range_cap: false, caps_value: 0,
         });
-        moves.push(Move {
+        push_unique(moves, Move {
             from_sq: from, to_sq: to, promotion: true,
             captured_piece: captured, captured_color: cap_color,
             is_igui: false, mid_sq: INVALID_SQ, mid_piece: 0, mid_color: 0,
-            range_caps: None,
+            range_cap: false, caps_value: 0,
         });
     } else {
-        moves.push(Move {
+        push_unique(moves, Move {
             from_sq: from, to_sq: to, promotion: false,
             captured_piece: captured, captured_color: cap_color,
             is_igui: false, mid_sq: INVALID_SQ, mid_piece: 0, mid_color: 0,
-            range_caps: None,
+            range_cap: false, caps_value: 0,
         });
     }
 }
@@ -718,7 +755,7 @@ fn gen_area(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
                         m.captured_piece = cell_piece(t2);
                         m.captured_color = cell_color(t2);
                     }
-                    moves.push(m);
+                    push_unique(moves, m);
                 } else {
                     add_move(moves, sq as u16, sq2 as u16, pt, color, t2);
                 }
@@ -729,33 +766,32 @@ fn gen_area(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
 
 fn gen_range_capture(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
                      rt: &RayTable, moves: &mut Vec<Move>) {
-    use std::rc::Rc;
     let piece_rank = pieces::rank(pt);
 
     for &dir in &mv.range_capture {
         let ray = rt.ray_for_color(sq, dir as usize, color);
-        let mut captured_list: Vec<(u16, u16, u8)> = Vec::new();
-        let mut shared: Option<Rc<Vec<(u16, u16, u8)>>> = None;
+        // Running sum of values captured on intermediate squares. Every
+        // emitted move captures ALL occupied squares between `from` and its
+        // destination (recomputed incrementally in apply_move), so the sum
+        // only grows along the ray.
+        let mut caps_value: i32 = 0;
 
         for &rsq in ray {
             let target = board.cells[rsq as usize];
             if target == EMPTY_CELL {
                 let mut m = Move::simple(sq as u16, rsq);
-                if let Some(ref rc) = shared {
-                    m.range_caps = Some(Rc::clone(rc));
-                }
+                m.range_cap = true;
+                m.caps_value = caps_value;
                 moves.push(m);
             } else {
                 let t_pt = cell_piece(target);
                 let t_rank = pieces::rank(t_pt);
                 if t_rank > piece_rank {
-                    // The move that STOPS at rsq captures rsq via `captured_piece`;
-                    // `range_caps` must hold only the INTERMEDIATE squares (shared
-                    // BEFORE rsq). Including rsq itself in range_caps made undo
-                    // restore the destination piece twice (double add -> piece_list
-                    // overflow). Record rsq for SUBSEQUENT (further) moves only
-                    // after building the move to rsq.
-                    let this_shared = shared.clone();
+                    // The move that STOPS at rsq captures rsq as the LANDING
+                    // square (via `captured_piece`); rsq becomes an
+                    // INTERMEDIATE capture for all subsequent moves along
+                    // this ray, and its value joins caps_value after this
+                    // move is emitted.
                     let from_in = in_promo_zone(sq, color);
                     let to_in = in_promo_zone(rsq as usize, color);
                     let may_promo = can_promote(pt) && (
@@ -767,32 +803,33 @@ fn gen_range_capture(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
                         let mut m = Move::simple(sq as u16, rsq);
                         m.captured_piece = t_pt;
                         m.captured_color = cell_color(target);
-                        m.range_caps = this_shared.clone();
+                        m.range_cap = true;
+                        m.caps_value = caps_value;
                         m.promotion = true;
                         moves.push(m);
                     } else if may_promo {
                         let mut m1 = Move::simple(sq as u16, rsq);
                         m1.captured_piece = t_pt;
                         m1.captured_color = cell_color(target);
-                        m1.range_caps = this_shared.clone();
+                        m1.range_cap = true;
+                        m1.caps_value = caps_value;
                         moves.push(m1);
                         let mut m2 = Move::simple(sq as u16, rsq);
                         m2.captured_piece = t_pt;
                         m2.captured_color = cell_color(target);
-                        m2.range_caps = this_shared.clone();
+                        m2.range_cap = true;
+                        m2.caps_value = caps_value;
                         m2.promotion = true;
                         moves.push(m2);
                     } else {
                         let mut m = Move::simple(sq as u16, rsq);
                         m.captured_piece = t_pt;
                         m.captured_color = cell_color(target);
-                        m.range_caps = this_shared.clone();
+                        m.range_cap = true;
+                        m.caps_value = caps_value;
                         moves.push(m);
                     }
-                    // Record rsq so further moves along this ray capture it as an
-                    // intermediate square.
-                    captured_list.push((rsq, t_pt, cell_color(target)));
-                    shared = Some(Rc::new(captured_list.clone()));
+                    caps_value += pieces::value(t_pt) as i32;
                 } else {
                     break;
                 }

@@ -256,7 +256,8 @@ fn m_pack(m: &Move) -> u32 {
 }
 
 fn is_tactical(m: &Move) -> bool {
-    m.captured_piece != 0 || m.mid_piece != 0 || m.promotion || m.range_caps.is_some()
+    m.captured_piece != 0 || m.mid_piece != 0 || m.promotion || m.is_igui
+        || (m.range_cap && m.caps_value != 0)
 }
 
 // ── Move ordering ───────────────────────────────────────────────
@@ -271,9 +272,7 @@ fn score_move(m: &Move, tt_move: u32, hist: i32, cntr: i32, depth: u32) -> i32 {
         let mut score = 1_000_000;
         if m.captured_piece != 0 { score += vals[m.captured_piece as usize] * 100; }
         if m.mid_piece != 0 { score += vals[m.mid_piece as usize] * 100; }
-        if let Some(ref caps) = m.range_caps {
-            for &(_, pt, _) in caps.iter() { score += vals[pt as usize] * 100; }
-        }
+        if m.range_cap && m.caps_value != 0 { score += m.caps_value * 100; }
         if m.promotion { score += 5000; }
         return score;
     }
@@ -334,9 +333,7 @@ fn search_root_window(
             }
             if m.captured_piece != 0 { delta += sign * values[m.captured_piece as usize]; }
             if m.mid_piece != 0 { delta += sign * values[m.mid_piece as usize]; }
-            if let Some(ref caps) = m.range_caps {
-                for &(_, pt, _) in caps.iter() { delta += sign * values[pt as usize]; }
-            }
+            if m.range_cap { delta += sign * m.caps_value; }
             let s = -(base_mat + delta);
             if s > best_score { best_score = s; best_move = Some(m.clone()); }
         }
@@ -717,12 +714,12 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     // history tables are per-side, and the beta-cutoff blocks below run
     // after board.undo_move() has already restored the parent's side.
     let stm = board.side_to_move;
-    let rps_beam = if d <= 2 { 24 } else if d <= 4 { 12 } else { 6 };
     // ── BEST MOVE AS SCALAR ───────────────────────────────────
     // Track the best move as its packed u32 instead of a cloned Move.
-    // Move contains an Option<Rc<Vec<...>>> (range_caps) plus 12 fields;
-    // cloning it on every alpha raise trashes L1/L2 for data we only need
-    // to store into the TT as a u32 anyway. (Recommendation: pack to scalar.)
+    // The Move struct is a plain POD now (range captures are recomputed in
+    // apply_move from from/to, no heap payload), but the TT only needs the
+    // packed key anyway — cloning a 16-byte struct per alpha raise is pure
+    // waste.
     let mut best_packed: u32 = 0;
     let mut tt_flag: u8 = 2; // UPPERBOUND
     let init_alpha = alpha;
@@ -743,6 +740,14 @@ fn pvs(board: &mut Board, depth: u32, mut alpha: i32, beta: i32,
     } else {
         cap_moves
     };
+    // ── CAPTURE BEAM SCALED BY REAL BRANCHING (C++ LMP fix) ──────
+    // With hundreds of tactical moves per node (median branching 944,
+    // max 1254), a fixed 6-24 beam prunes a far larger FRACTION of moves
+    // than intended. Scale the threshold with the actual list length so
+    // the pruned fraction stays comparable to chess:
+    //   beam = base * (1 + tactical_moves / 128)
+    let beam_base = if d <= 2 { 24 } else if d <= 4 { 12 } else { 6 };
+    let rps_beam = (beam_base * (1 + cap_moves.len() / 128)).min(96);
     // ── Incremental move selection (pick-next) ────────────────────
     // Score once into a flat i32 buffer, then repeatedly select the best
     // remaining move: O(k·n) with k ≈ rps_beam (6-24) instead of a full
@@ -982,9 +987,7 @@ fn capture_qs_score(board: &Board, m: &Move, values: &[i32; 512]) -> i32 {
     let mut score = 0;
     if m.captured_piece != 0 { score += values[m.captured_piece as usize] * 10; }
     if m.mid_piece != 0 { score += values[m.mid_piece as usize] * 10; }
-    if let Some(ref caps) = m.range_caps {
-        for &(_, pt, _) in caps.iter() { score += values[pt as usize] * 10; }
-    }
+    if m.range_cap { score += m.caps_value * 10; }
     if m.promotion {
         if let Some(promoted) = pieces::promotes_to(from_pt) {
             score += values[promoted as usize] - values[from_pt as usize];

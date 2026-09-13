@@ -182,11 +182,16 @@ pub struct Move {
     pub mid_sq: u16,           // INVALID_SQ if none
     pub mid_piece: u16,
     pub mid_color: u8,
-    // Range captures stored separately (rare).
-    // Rc so that generating many moves that share the same growing capture
-    // prefix along a ray (movegen.rs::gen_range_capture) is O(1) per move
-    // (refcount bump) instead of O(n) (deep-copying the Vec each time).
-    pub range_caps: Option<std::rc::Rc<Vec<(u16, u16, u8)>>>, // (sq, piece, color)
+    /// True for moves emitted by the range-capture generator. `apply_move`
+    /// recomputes ALL occupied squares strictly between from and to (any
+    /// color — rank legality was verified at generation) and captures them,
+    /// plain POD: no `Rc<Vec<..>>`, zero heap allocations in the search.
+    pub range_cap: bool,
+    /// Sum of the values of pieces captured on INTERMEDIATE squares of a
+    /// range-capture move (the landing capture is in `captured_piece`).
+    /// Used for move ordering and the material-delta fast path; always 0
+    /// for non-range-capture moves.
+    pub caps_value: i32,
 }
 
 impl Move {
@@ -195,7 +200,7 @@ impl Move {
             from_sq: from, to_sq: to, promotion: false,
             captured_piece: 0, captured_color: 0, is_igui: false,
             mid_sq: INVALID_SQ, mid_piece: 0, mid_color: 0,
-            range_caps: None,
+            range_cap: false, caps_value: 0,
         }
     }
 }
@@ -222,7 +227,12 @@ pub struct UndoInfo {
     pub move_number: u32,
     pub mid_sq: u16,
     pub mid_cell: Cell,
-    pub range_caps: Option<Vec<(u16, Cell)>>,
+    /// Index into `Board::cap_stack` marking where this move's captured
+    /// pops the stack back down to this base. No heap allocation.
+    pub cap_base: usize,
+    /// Snapshot of the NNUE accumulator before the move (only populated
+    /// when the NNUE backend is active). Undo restores it in O(1).
+    pub nnue_acc: Option<crate::eval::nnue::Accumulator>,
     pub no_progress_plies: u32,
     pub hash: u64,
     /// Incremental material score snapshot for fast undo.

@@ -152,6 +152,7 @@ pub fn generate_captures_bb(board: &Board) -> (Vec<crate::types::Move>, GenMode)
         let cell = board.cells[sq];
         if cell == EMPTY_CELL { continue; }
         let pt = cell_piece(cell);
+        crate::movegen::dedup_begin();
         let tmpl = &t[(pt as usize).min(511)][color as usize];
 
         if !tmpl.valid {
@@ -257,18 +258,29 @@ fn gen_hook_captures(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
 }
 
 /// Generate range-capture moves (captures pieces of lower rank along rays).
+/// `range_cap = true` makes apply_move recompute and capture ALL occupied
+/// squares between from and to — previously this fast path left intermediate
+/// captures unapplied (the old Move had range_caps: None here), silently
+/// diverging from the generator's intent.
 fn gen_range_capture_captures(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement,
                               rt: &RayTable, moves: &mut Vec<crate::types::Move>) {
     let piece_rank = pieces::rank(pt);
     for &dir in &mv.range_capture {
         let ray = rt.ray_for_color(sq, dir as usize, color);
+        let mut caps_value: i32 = 0;
         for &rsq in ray {
             let target = board.cells[rsq as usize];
             if target == EMPTY_CELL { continue; }
             let t_pt = cell_piece(target);
             let t_rank = pieces::rank(t_pt);
             if t_rank > piece_rank {
-                push_move(moves, sq as u16, rsq, pt, color, target);
+                let mut m = crate::types::Move::simple(sq as u16, rsq);
+                m.captured_piece = t_pt;
+                m.captured_color = cell_color(target);
+                m.range_cap = true;
+                m.caps_value = caps_value;
+                crate::movegen::push_unique(moves, m);
+                caps_value += pieces::value(t_pt) as i32;
             } else { break; }
         }
     }
@@ -317,7 +329,7 @@ fn gen_lion_captures(board: &Board, sq: usize, pt: u16, color: u8, mv: &Movement
                         m.captured_piece = cell_piece(t2);
                         m.captured_color = cell_color(t2);
                     }
-                    moves.push(m);
+                    crate::movegen::push_unique(moves, m);
                 } else if t2 != EMPTY_CELL && cell_color(t2) != color {
                     // Direct capture at second step (path empty).
                     push_move(moves, sq as u16, sq2 as u16, pt, color, t2);
@@ -420,6 +432,7 @@ pub fn generate_simple_moves(board: &Board) -> (Vec<crate::types::Move>, GenMode
         let cell = board.cells[sq];
         if cell == EMPTY_CELL { continue; }
         let pt = cell_piece(cell);
+        crate::movegen::dedup_begin();
         let tmpl = &t[(pt as usize).min(511)][color as usize];
 
         if !tmpl.valid {
@@ -469,11 +482,11 @@ fn push_move(moves: &mut Vec<crate::types::Move>, from: u16, to: u16, pt: u16,
              color: u8, target: Cell) {
     let captured = if target != EMPTY_CELL { cell_piece(target) } else { 0 };
     let cap_color = if target != EMPTY_CELL { cell_color(target) } else { 0 };
-    moves.push(crate::types::Move {
+    crate::movegen::push_unique(moves, crate::types::Move {
         from_sq: from, to_sq: to, promotion: false,
         captured_piece: captured, captured_color: cap_color,
         is_igui: false, mid_sq: INVALID_SQ, mid_piece: 0, mid_color: 0,
-        range_caps: None,
+        range_cap: false, caps_value: 0,
     });
 }
 
@@ -482,12 +495,12 @@ fn push_move_igui(moves: &mut Vec<crate::types::Move>, from: u16, pt: u16,
                   color: u8, target: Cell) {
     let captured = cell_piece(target);
     let cap_color = cell_color(target);
-    moves.push(crate::types::Move {
+    crate::movegen::push_unique(moves, crate::types::Move {
         from_sq: from, to_sq: from,
         promotion: false,
         captured_piece: captured, captured_color: cap_color,
         is_igui: true, mid_sq: INVALID_SQ, mid_piece: 0, mid_color: 0,
-        range_caps: None,
+        range_cap: false, caps_value: 0,
     });
 }
 
