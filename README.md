@@ -217,6 +217,14 @@ HalfKP-style features) can be enabled at runtime with
 in the `TAIKYOKU_NNUE_PATH` environment variable. Run the `toggle_nnue`
 example for a smoke test.
 
+The accumulator is now maintained **incrementally** by `Board::apply_move`
+(O(FT_NEURONS) deltas per moved/captured piece, full refresh only when a
+royal anchor changes) and restored in O(1) on undo, so per-evaluate cost no
+longer includes the O(pieces × FT_NEURONS) rebuild. The remaining per-call
+cost is the network forward pass itself (~3 ms with the current dense
+layers — fine for validation and training pipelines; faster inference needs
+the flattened-weight redesign planned for the next architecture).
+
 The full PyTorch training pipeline — generating data with `selfplay`,
 feature extraction, training, and exporting `.nnue` files — lives in
 [training/](training/README.md).

@@ -84,13 +84,6 @@ pub fn feature_index(king_sq: usize, piece_sq: usize, piece_type: u16, color: u8
 
 #[derive(Clone, Debug)]
 pub struct Accumulator {
-    /// Accumulated values for the current perspective (FT_NEURONS).
-    ///
-    /// i32, NOT i16: with up to 804 active features on a 36x36 board the
-    /// worst-case sum is 804 * 32_767 + 8_191 = 26.4M, far beyond i16 but
-    /// still 81x inside i32. An i16 accumulator saturates constantly and
-    /// turns every neuron into a flat 255 after the clipped ReLU (the exact
-    /// failure ADR-008 of TaikyokuShogi-Stockfish diagnoses).
     pub white: Vec<i32>,
     pub black: Vec<i32>,
 }

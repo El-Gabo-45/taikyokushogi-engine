@@ -1,12 +1,10 @@
 // Confirms the hand-crafted vs NNUE evaluation toggle switches which code
-// path runs, using a SINGLE evaluate() call (not a full search) since
-// nnue_evaluate_from_scratch rebuilds the Accumulator from scratch on
-// every call (O(pieces * FT_NEURONS), not incremental yet -- see the
-// comment on nnue_evaluate_from_scratch in nnue.rs and training/README.md's
-// "Known limitation: NNUE eval is not yet wired for incremental updates"
-// section). A full multi-thousand-node search with this is currently WAY
-// too slow to be practical -- that's a real, known limitation, not
-// something this example works around.
+// path runs. The NNUE accumulator is maintained incrementally by
+// apply_move/undo_move now (see training/README.md), but this example calls
+// evaluate() on a freshly-built board whose accumulator is still empty, so
+// the single call includes one from-scratch refresh plus the one-time
+// random-weight initialization. For incremental-vs-scratch timings see the
+// nnue_speed example.
 //
 // Usage: cargo run --release --example toggle_nnue
 //    or: TAIKYOKU_NNUE_PATH=/path/to/trained.nnue cargo run --release --example toggle_nnue
@@ -33,8 +31,9 @@ fn main() {
     } else {
         println!("\nNOTE: scores matched -- unlikely but not impossible by coincidence with an untrained/random NNUE.");
     }
-    println!("\nNOTE: the NNUE timing above is for a SINGLE evaluate() call. Using");
-    println!("this inside search (thousands of calls per move) is currently too");
-    println!("slow to be practical without incremental accumulator updates --");
-    println!("see training/README.md for details and next steps.");
+    println!("\nNOTE: the NNUE timing above is for a SINGLE evaluate() call on a");
+    println!("freshly-built board, so it includes one from-scratch accumulator");
+    println!("refresh plus one-time random-weight initialization. After moves are");
+    println!("applied, evaluate() uses the incrementally-maintained accumulator");
+    println!("(see the nnue_speed example for the incremental vs scratch timing).");
 }

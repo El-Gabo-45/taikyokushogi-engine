@@ -1,10 +1,3 @@
-//! Deterministic perft (node count) from the initial position.
-//!
-//! Reference values from the TaikyokuShogi-Stockfish audit (README.md):
-//!   perft(1) = 488
-//!   perft(2) = 237,684
-//!   perft(3) = 124,729,180
-//! Run with: cargo run --release --example perft -- [depth]
 use taikyokushogi::Board;
 
 fn perft(mut board: &mut Board, depth: u32) -> u64 {
